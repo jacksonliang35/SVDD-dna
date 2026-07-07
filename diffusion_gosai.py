@@ -1038,7 +1038,8 @@ class Diffusion(L.LightningModule):
     dt = (1 - eps) / num_steps
     p_x0_cache = None
 
-    for i in range(num_steps):
+    # for i in range(num_steps):
+    for i in tqdm(range(num_steps), desc="Diffusion steps", unit="step", leave=False, dynamic_ncols=True):
       t = timesteps[i] * torch.ones(
         x.shape[0], 1, device=self.device)
       if self.sampler == 'ddpm':
@@ -1122,7 +1123,8 @@ class Diffusion(L.LightningModule):
     dt = (1 - eps) / num_steps
     p_x0_cache = None
 
-    for i in range(num_steps):
+    # for i in range(num_steps):
+    for i in tqdm(range(num_steps), desc="Diffusion steps", unit="step", leave=False, dynamic_ncols=True):
       t = timesteps[i] * torch.ones(
         x.shape[0], 1, device=self.device)
       if self.sampler == 'ddpm':

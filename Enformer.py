@@ -17,6 +17,7 @@ from hydra import initialize, compose
 from hydra.core.global_hydra import GlobalHydra
 import dataloader_gosai
 from grelu.lightning import LightningModel
+from tqdm.auto import tqdm
 
 class BaseModel(nn.Module):
     """
@@ -89,7 +90,7 @@ class BaseModel(nn.Module):
             cfg = compose(config_name="config_gosai.yaml")
 
         # Initialize the model
-        self.ref_model = diffusion_gosai.Diffusion.load_from_checkpoint(CKPT_PATH, config=cfg, map_location='cpu')
+        self.ref_model = diffusion_gosai.Diffusion.load_from_checkpoint(CKPT_PATH, config=cfg, map_location='cpu', weights_only=False)
         # self.detokenizer = dataloader_gosai.DNASequenceDetokenizer()
 
         # self.ref_model.load_state_dict(torch.load(ref_model_path, map_location='cpu')['model_state_dict'], strict=True)
@@ -123,7 +124,7 @@ class BaseModel(nn.Module):
                 gru_norm=True, )
             human_head = ConvHead(n_tasks=1, in_channels=64, act_func=None, pool_func='avg', norm=False)
             self.reward_model = OriBaseModel(embedding=common_trunk, head=human_head)
-            ckpt_human = torch.load("artifacts/RNA_Stability_oracle:v0/rna_saluki_diffusion_enformer_7_11_1536_16_ep10_it3200.pt", map_location='cpu')
+            ckpt_human = torch.load("artifacts/RNA_Stability_oracle:v0/rna_saluki_diffusion_enformer_7_11_1536_16_ep10_it3200.pt", map_location='cpu', weights_only=False)
             self.reward_model.load_state_dict(ckpt_human, strict=True)
         else:
             self.reward_model = LightningModel.load_from_checkpoint("artifacts/DNA_evaluation:v0/model.ckpt", map_location='cpu')
@@ -436,7 +437,8 @@ class BaseModel(nn.Module):
         samples = []
         value_func_preds = []
         reward_model_preds = []
-        for i in range(gen_batch_num):
+        # for i in range(gen_batch_num):
+        for i in tqdm(range(gen_batch_num), desc="Value-weighted generation", unit="batch", dynamic_ncols=True,):
             batch_samples = self.ref_model.controlled_sample(self.embedding, self.head, eval_sp_size=self.NUM_SAMPLES_PER_BATCH, sample_M=sample_M)
             samples.append(batch_samples)
             onehot_samples = self.transform_samples(batch_samples)
@@ -453,7 +455,8 @@ class BaseModel(nn.Module):
         # baseline_samples = []
         baseline_preds = []
         all_preds = []
-        for i in range(gen_batch_num*sample_M):
+        # for i in range(gen_batch_num*sample_M):
+        for i in tqdm(range(gen_batch_num*sample_M), desc="Baseline generation", unit="batch", dynamic_ncols=True,):
             batch = self.ref_model.decode_sample(eval_sp_size=self.NUM_SAMPLES_PER_BATCH)
             onehot_samples = self.transform_samples(batch)
             if self.task == "rna_saluki":
@@ -516,7 +519,7 @@ class BaseModel(nn.Module):
         samples = []
         value_func_preds = []
         reward_model_preds = []
-        for i in range(gen_batch_num):
+        for i in tqdm(range(gen_batch_num), desc="Value-weighted generation", unit="batch", dynamic_ncols=True):
             batch_samples = self.ref_model.controlled_sample_TDS(self.reward_model, alpha, eval_sp_size=self.NUM_SAMPLES_PER_BATCH, sample_M=sample_M)
             samples.append(batch_samples)
             onehot_samples = self.transform_samples(batch_samples)
@@ -533,7 +536,7 @@ class BaseModel(nn.Module):
         # baseline_samples = []
         baseline_preds = []
         all_preds = []
-        for i in range(gen_batch_num*sample_M):
+        for i in tqdm(range(gen_batch_num*sample_M), desc="Baseline generation", unit="batch", dynamic_ncols=True):
             batch = self.ref_model.decode_sample(eval_sp_size=self.NUM_SAMPLES_PER_BATCH)
             onehot_samples = self.transform_samples(batch)
             if self.task == "rna_saluki":
@@ -596,7 +599,7 @@ class BaseModel(nn.Module):
         samples = []
         value_func_preds = []
         reward_model_preds = []
-        for i in range(gen_batch_num):
+        for i in tqdm(range(gen_batch_num), desc="Value-weighted generation", unit="batch", dynamic_ncols=True):
             batch_samples = self.ref_model.controlled_sample_DPS(self.reward_model, guidance_scale, eval_sp_size=self.NUM_SAMPLES_PER_BATCH, sample_M=sample_M)
             samples.append(batch_samples)
             onehot_samples = self.transform_samples(batch_samples)
@@ -613,7 +616,7 @@ class BaseModel(nn.Module):
         # baseline_samples = []
         baseline_preds = []
         all_preds = []
-        for i in range(gen_batch_num*sample_M):
+        for i in tqdm(range(gen_batch_num*sample_M), desc="Baseline generation", unit="batch", dynamic_ncols=True):
             batch = self.ref_model.decode_sample(eval_sp_size=self.NUM_SAMPLES_PER_BATCH)
             onehot_samples = self.transform_samples(batch)
             if self.task == "rna_saluki":
@@ -675,7 +678,7 @@ class BaseModel(nn.Module):
         samples = []
         value_func_preds = []
         reward_model_preds = []
-        for i in range(gen_batch_num):
+        for i in tqdm(range(gen_batch_num), desc="Value-weighted generation", unit="batch", dynamic_ncols=True):
             batch_samples = self.ref_model.controlled_sample_classfier(self.embedding, self.head, eval_sp_size=self.NUM_SAMPLES_PER_BATCH, guidance_scale = guidance_scale)
             samples.append(batch_samples)
             onehot_samples = self.transform_samples(batch_samples)
@@ -692,7 +695,7 @@ class BaseModel(nn.Module):
         # baseline_samples = []
         baseline_preds = []
         all_preds = []
-        for i in range(gen_batch_num* sample_M):
+        for i in tqdm(range(gen_batch_num*sample_M), desc="Baseline generation", unit="batch", dynamic_ncols=True):
             batch = self.ref_model.decode_sample(eval_sp_size=self.NUM_SAMPLES_PER_BATCH)
             onehot_samples = self.transform_samples(batch)
             if self.task == "rna_saluki":
@@ -758,7 +761,7 @@ class BaseModel(nn.Module):
         samples = []
         value_func_preds = []
         reward_model_preds = []
-        for i in range(gen_batch_num):
+        for i in tqdm(range(gen_batch_num), desc="Value-weighted generation", unit="batch", dynamic_ncols=True):
             batch_samples = self.ref_model.controlled_sample_tweedie(self.reward_model, eval_sp_size=self.NUM_SAMPLES_PER_BATCH, sample_M=sample_M, options = options, task=self.task)
             samples.extend(batch_samples)
             onehot_samples = self.transform_samples(batch_samples)
@@ -775,7 +778,7 @@ class BaseModel(nn.Module):
         # baseline_samples = []
         baseline_preds = []
         all_preds = []
-        for i in range(gen_batch_num*sample_M):
+        for i in tqdm(range(gen_batch_num*sample_M), desc="Baseline generation", unit="batch", dynamic_ncols=True):
             batch = self.ref_model.decode_sample(eval_sp_size=self.NUM_SAMPLES_PER_BATCH)
             onehot_samples = self.transform_samples(batch)
             if self.task == "rna_saluki":

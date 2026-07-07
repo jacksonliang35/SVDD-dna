@@ -78,7 +78,7 @@ def run(args, rank=None):
         common_trunk = EnformerTrunk(n_conv=7, channels=1536, n_transformers=11, n_heads=8, key_len=64,
                                      attn_dropout=0.05, pos_dropout=0.01, ff_dropout=0.4, crop_len=0)
         reg_head = ConvHead(n_tasks=1, in_channels=2 * 1536, act_func=None, pool_func='avg')
-        model = BaseModel(embedding=common_trunk, head=reg_head, cdq=args.cdq, batch_size=args.batch_size, val_batch_num=1, task=args.task, n_tasks=args.n_task, saluki_body=args.saluki_body)
+        model = BaseModel(embedding=common_trunk, head=reg_head, cdq=args.cdq, batch_size=args.batch_size, val_batch_num=args.val_batch_num, task=args.task, n_tasks=args.n_task, saluki_body=args.saluki_body)
     elif args.model == 'multienformer':
         common_trunk = EnformerTrunk(n_conv=7, channels=1536, n_transformers=11, n_heads=8, key_len=64,
                                      attn_dropout=0.05, pos_dropout=0.01, ff_dropout=0.4, crop_len=0)
@@ -166,7 +166,7 @@ if __name__ == '__main__':
                         help="sample width", required=False)
     parser.add_argument('--val_batch_num', type=int, default=1,
                         help="val batches", required=False)
-    parser.add_argument('--num_workers', type=int, default=12,
+    parser.add_argument('--num_workers', type=int, default=4,
                         help="number of workers for data loaders", required=False)
     parser.add_argument('--save_start_epoch', type=int, default=120,
                         help="save model start epoch", required=False)
