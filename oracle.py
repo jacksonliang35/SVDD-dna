@@ -1,4 +1,4 @@
-import wandb
+# import wandb
 import torch
 import grelu
 import pandas as pd
@@ -22,9 +22,11 @@ DEFAULT_WANDB_HOST = 'https://genentech.wandb.io'
 
 def _check_wandb(host=DEFAULT_WANDB_HOST):
     pass
+    # import wandb
     # assert wandb.login(host=host), f'Weights & Biases (wandb) is not configured, see {DEFAULT_WANDB_HOST}/authorize'
 
 def get_artifact(name, project, alias='latest'):
+    import wandb
     _check_wandb()
     project_path = f'{DEFAULT_WANDB_ENTITY}/{project}'
     

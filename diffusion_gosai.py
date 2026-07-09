@@ -20,6 +20,8 @@ import utils
 import oracle
 from scipy.stats import wasserstein_distance, pearsonr
 
+from tqdm import tqdm
+
 LOG2 = math.log(2)
 LOGGER = utils.get_logger(__name__)
 
@@ -342,7 +344,7 @@ class Diffusion(L.LightningModule):
     sigma = self._process_sigma(sigma)
     # x = F.one_hot(x, num_classes=self.vocab_size).to(torch.float32)
 
-    with torch.cuda.amp.autocast(dtype=torch.float32):
+    with torch.amp.autocast('cuda', dtype=torch.float32):
       logits = self.backbone(x, sigma)
     
     if self.parameterization == 'subs':
@@ -362,7 +364,7 @@ class Diffusion(L.LightningModule):
     sigma = self._process_sigma(sigma)
     # x = F.one_hot(x, num_classes=self.vocab_size).to(torch.float32)
 
-    with torch.cuda.amp.autocast(dtype=torch.float32):
+    with torch.amp.autocast('cuda', dtype=torch.float32):
       logits = self.backbone.forward2(x_onehot, sigma)
     
     if self.parameterization == 'subs':
