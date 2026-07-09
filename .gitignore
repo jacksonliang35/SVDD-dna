@@ -1,5 +1,6 @@
 *.sh 
 wandb/
+log/
 /__pycache__/
 artifacts/
 *.pyc

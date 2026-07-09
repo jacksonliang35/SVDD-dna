@@ -127,7 +127,7 @@ def patch_grelu_checkpoint_if_needed(path: Path) -> None:
         print(f"Patched gReLU metadata in {path}")
 
 
-def build_model(args):
+def build_model(args, device="cuda"):
     if args.model == "enformer":
         common_trunk = EnformerTrunk(
             n_conv=7,
@@ -150,6 +150,7 @@ def build_model(args):
             task=args.task,
             n_tasks=args.n_task,
             saluki_body=args.saluki_body,
+            device=torch.device(device)
         )
 
     if args.model == "multienformer":
@@ -171,6 +172,7 @@ def build_model(args):
             cdq=args.cdq,
             batch_size=args.batch_size,
             val_batch_num=args.val_batch_num,
+            device=torch.device(device)
         )
 
     if args.model == "timedenformer":
@@ -196,6 +198,7 @@ def build_model(args):
             task=args.task,
             n_tasks=args.n_task,
             saluki_body=args.saluki_body,
+            device=torch.device(device)
         )
 
     raise NotImplementedError(f"Unknown model: {args.model}")
@@ -352,7 +355,8 @@ def run(args) -> Path:
         patch_grelu_checkpoint_if_needed(expected_reward)
 
     print("loading model")
-    model = build_model(args)
+    device = args.device if hasattr(args, "device") else "cuda"
+    model = build_model(args, device)
 
     if args.pre_model_path is not None:
         print("loading pretrained value model:", args.pre_model_path)
@@ -363,7 +367,10 @@ def run(args) -> Path:
         load_model_state(model, Path(args.load_checkpoint_path), strict=True)
 
     print("total params:", sum(p.numel() for p in model.parameters()))
-    model.cuda()
+
+    model.to(device)
+    print("Using device:", device)
+
     model.eval()
 
     gen_samples, value_func_preds, reward_model_preds, selected_baseline_preds, baseline_preds = controlled_decode_local(
@@ -411,6 +418,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--val_batch_num", type=int, default=1)
     parser.add_argument("--variant", type=str, default="MC", choices=["MC", "PM"])
     parser.add_argument("--seed", type=int, default=44)
+    parser.add_argument("--device", type=str, default="cuda")
 
     parser.add_argument("--pre_model_path", type=str, default=None)
     parser.add_argument("--load_checkpoint_path", type=str, default=None)

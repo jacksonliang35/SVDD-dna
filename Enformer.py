@@ -24,11 +24,12 @@ class BaseModel(nn.Module):
     Base model class
     """
 
-    def __init__(self, embedding: nn.Module, head: nn.Module, cdq, batch_size, val_batch_num, timed=False, task="rna_saluki", n_tasks=1, saluki_body=0) -> None:
+    def __init__(self, embedding: nn.Module, head: nn.Module, cdq, batch_size, val_batch_num, timed=False, task="rna_saluki", n_tasks=1, saluki_body=0, device="cuda") -> None:
         super().__init__()
         self.task = task
         self.n_tasks = n_tasks
         self.saluki_body = saluki_body
+        self.device = device
         if self.task == "rna_saluki" or self.task == "rna":
             self.embedding = ConvGRUTrunk(
                 stem_in_channels=4,
@@ -95,7 +96,7 @@ class BaseModel(nn.Module):
 
         # self.ref_model.load_state_dict(torch.load(ref_model_path, map_location='cpu')['model_state_dict'], strict=True)
         # self.tokenizer = tokenizer
-        self.ref_model.cuda()
+        self.ref_model.to(self.device)
         self.ref_model.eval()
         # Freeze the ref_model parameters
         for param in self.ref_model.parameters():
@@ -128,7 +129,7 @@ class BaseModel(nn.Module):
             self.reward_model.load_state_dict(ckpt_human, strict=True)
         else:
             self.reward_model = LightningModel.load_from_checkpoint("artifacts/DNA_evaluation:v0/model.ckpt", map_location='cpu')
-        self.reward_model.cuda()
+        self.reward_model.to(self.device)
         self.reward_model.eval()
         for param in self.reward_model.parameters():
             param.requires_grad = False
@@ -205,7 +206,7 @@ class BaseModel(nn.Module):
             if self.timed:
                 total_loss = 0
                 for i, (sample, y) in enumerate(zip(onehot_mid_samples, targets)):
-                    x = self.embedding(sample.float(), torch.full((sample.shape[0], sample.shape[1]), i).cuda())
+                    x = self.embedding(sample.float(), torch.full((sample.shape[0], sample.shape[1]), i).to(self.device))
                     x = self.head(x)
                     if x.shape != y.shape:
                         x = x.squeeze(2)
@@ -326,7 +327,7 @@ class BaseModel(nn.Module):
             y = target.detach().clone()
             x0 = x0.float()
             if self.timed:
-                x = self.embedding(x0, torch.full((x0.shape[0], x0.shape[1]), i).cuda())
+                x = self.embedding(x0, torch.full((x0.shape[0], x0.shape[1]), i).to(self.device))
             else:
                 x = self.embedding(x0)
             x = self.head(x)
@@ -376,7 +377,7 @@ class BaseModel(nn.Module):
             self.reward_model = LightningModel.load_from_checkpoint(
                 "artifacts/DNA_evaluation:v0/model.ckpt", map_location='cpu')
 
-        self.reward_model.cuda()
+        self.reward_model.to(self.device)
         self.reward_model.eval()
         self.pearsonr.reset()
         targets = []
@@ -432,7 +433,7 @@ class BaseModel(nn.Module):
             self.reward_model = LightningModel.load_from_checkpoint(
                  "artifacts/DNA_evaluation:v0/model.ckpt", map_location='cpu')
 
-        self.reward_model.cuda()
+        self.reward_model.to(self.device)
         self.reward_model.eval()
         samples = []
         value_func_preds = []
@@ -514,7 +515,7 @@ class BaseModel(nn.Module):
             self.reward_model = LightningModel.load_from_checkpoint(
                  "artifacts/DNA_evaluation:v0/model.ckpt", map_location='cpu')
 
-        self.reward_model.cuda()
+        self.reward_model.to(self.device)
         self.reward_model.eval()
         samples = []
         value_func_preds = []
@@ -594,7 +595,7 @@ class BaseModel(nn.Module):
             self.reward_model = LightningModel.load_from_checkpoint(
                  "artifacts/DNA_evaluation:v0/model.ckpt", map_location='cpu')
 
-        self.reward_model.cuda()
+        self.reward_model.to(self.device)
         #self.reward_model.eval()
         samples = []
         value_func_preds = []
@@ -673,7 +674,7 @@ class BaseModel(nn.Module):
             self.reward_model = LightningModel.load_from_checkpoint(
                 "artifacts/DNA_evaluation:v0/model.ckpt", map_location='cpu')
 
-        self.reward_model.cuda()
+        self.reward_model.to(self.device)
         self.reward_model.eval()
         samples = []
         value_func_preds = []
@@ -754,7 +755,7 @@ class BaseModel(nn.Module):
             self.reward_model = LightningModel.load_from_checkpoint(
                 "artifacts/DNA_evaluation:v0/model.ckpt", map_location='cpu')
 
-        self.reward_model.cuda()
+        self.reward_model.to(self.device)
         self.reward_model.eval()
 
 
@@ -872,7 +873,7 @@ class BaseModelMultiSep(nn.Module):
     Base model class
     """
 
-    def __init__(self, embedding: nn.Module, head: nn.Module, cdq, batch_size, val_batch_num) -> None:
+    def __init__(self, embedding: nn.Module, head: nn.Module, cdq, batch_size, val_batch_num, device="cuda") -> None:
         super().__init__()
         self.embedding = embedding
         self.head = head
@@ -907,6 +908,7 @@ class BaseModelMultiSep(nn.Module):
         self.loss_fct = nn.MSELoss()
         self.pearsonr = PearsonR(num_targets=1)
         self.cdq = cdq
+        self.device = device
         # self.mapping = {"A": 0, "C": 1, "G": 2, "T": 3} N: 4
         # self.num_features = len(self.mapping)
 
@@ -923,14 +925,14 @@ class BaseModelMultiSep(nn.Module):
 
         # self.ref_model.load_state_dict(torch.load(ref_model_path, map_location='cpu')['model_state_dict'], strict=True)
         # self.tokenizer = tokenizer
-        self.ref_model.cuda()
+        self.ref_model.to(self.device)
         self.ref_model.eval()
         # Freeze the ref_model parameters
         for param in self.ref_model.parameters():
             param.requires_grad = False
 
         self.reward_model = LightningModel.load_from_checkpoint("artifacts/DNA_evaluation:v0/model.ckpt", map_location='cpu')
-        self.reward_model.cuda()
+        self.reward_model.to(self.device)
         self.reward_model.eval()
         for param in self.reward_model.parameters():
             param.requires_grad = False
