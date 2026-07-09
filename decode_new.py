@@ -412,12 +412,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--saluki_body", type=int, default=0)
     parser.add_argument("--cdq", action="store_true", default=False)
 
-    parser.add_argument("--sampler", type=str, default="svdd")
+    parser.add_argument("--sampler", type=str, default="svdd", choices=["svdd", "smc"])
     parser.add_argument("--batch_size", type=int, default=256)
     parser.add_argument("--sample_M", type=int, default=5)
     parser.add_argument("--val_batch_num", type=int, default=1)
     parser.add_argument("--variant", type=str, default="MC", choices=["MC", "PM"])
-    parser.add_argument("--seed", type=int, default=44)
+    parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", type=str, default="cuda")
 
     parser.add_argument("--pre_model_path", type=str, default=None)

@@ -397,6 +397,78 @@ class BaseModel(nn.Module):
             predictions.append(pred)
             pearsonr_scores.append(self.pearsonr(target.view(-1), pred.view(-1)).item())
         return predictions, targets, np.mean(pearsonr_scores)
+    
+    @torch.no_grad()
+    def baseline_sample(self, gen_batch_num, sample_M):
+        samples = []
+        reward_model_preds = []
+        for i in tqdm(range(gen_batch_num), desc="Baseline generation", unit="batch", dynamic_ncols=True):
+            batch_samples = self.ref_model.decode_sample(eval_sp_size=self.NUM_SAMPLES_PER_BATCH)
+            samples.append(batch_samples)
+            onehot_samples = self.transform_samples(batch_samples)
+            if self.task == "rna_saluki":
+                pred = self.reward_model(self.transform_samples_saluki(batch_samples).float()).detach().squeeze(2)
+            elif self.n_tasks==1:
+                pred = self.reward_model(onehot_samples.float().transpose(1, 2)).detach()[:, 0]
+            else:
+                pred = self.reward_model(onehot_samples.float().transpose(1, 2)).detach()
+            reward_model_preds.extend(pred)
+
+        print("Baseline sampling done.")
+        return samples, torch.cat(reward_model_preds)
+    
+    @torch.no_grad()
+    def controlled_sample_svdd_mc(self, gen_batch_num, sample_M):
+        if self.task == "rna":
+            self.reward_model = LightningModel.load_from_checkpoint(
+                  "artifacts/RNA_evaluation:v0/model.ckpt",
+                map_location='cpu')
+        elif self.task == "rna_saluki":
+            common_trunk = ConvGRUTrunk(
+                stem_channels=64,
+                stem_kernel_size=15,
+                n_conv=6,
+                channel_init=64,
+                channel_mult=1,
+                kernel_size=5,
+                act_func="relu",
+                conv_norm=True,
+                pool_func=None,  # None, "max", "avg"
+                pool_size=None,
+                residual=True,  # False
+                crop_len=0,
+                n_gru=1,
+                dropout=0.1,  # 0.3
+                gru_norm=True, )
+            human_head = ConvHead(n_tasks=1, in_channels=64, act_func=None, pool_func='avg', norm=False)
+            self.reward_model = OriBaseModel(embedding=common_trunk, head=human_head)
+            ckpt_human = torch.load('/home/lix361/projects/rna_optimization/prediction_half_life/storage/ConvGRUModel_nochange_nopool_residual_ConvHeadnoactnonorm_dp0.1_lr1e-4_noclip_interbatch/epoch31/model_human.pth', map_location='cpu')
+            self.reward_model.load_state_dict(ckpt_human, strict=True)
+        else:
+            self.reward_model = LightningModel.load_from_checkpoint(
+                 "artifacts/DNA_evaluation:v0/model.ckpt", map_location='cpu')
+
+        self.reward_model.to(self.device)
+        self.reward_model.eval()
+        samples = []
+        value_func_preds = []
+        reward_model_preds = []
+        for i in tqdm(range(gen_batch_num), desc="Value-weighted generation", unit="batch", dynamic_ncols=True,):
+            batch_samples = self.ref_model.controlled_sample(self.embedding, self.head, eval_sp_size=self.NUM_SAMPLES_PER_BATCH, sample_M=sample_M)
+            samples.append(batch_samples)
+            onehot_samples = self.transform_samples(batch_samples)
+            value_func_preds.extend(self.head(self.embedding(onehot_samples.float())).squeeze(2).detach())
+            if self.task == "rna_saluki":
+                pred = self.reward_model(self.transform_samples_saluki(batch_samples).float()).detach().squeeze(2)
+            elif self.n_tasks==1:
+                pred = self.reward_model(onehot_samples.float().transpose(1, 2)).detach()[:, 0]
+            else:
+                pred = self.reward_model(onehot_samples.float().transpose(1, 2)).detach()
+            reward_model_preds.extend(pred)
+
+        print("Value-weighted MC sampling done.")
+
+        return samples, torch.cat(value_func_preds), torch.cat(reward_model_preds)
 
     @torch.no_grad()
     def controlled_decode(self, gen_batch_num, sample_M):
@@ -719,6 +791,64 @@ class BaseModel(nn.Module):
 
         return samples, torch.cat(value_func_preds), torch.cat(reward_model_preds), top_k_values, torch.cat(baseline_preds)
     
+    @torch.no_grad()
+    def controlled_sample_svdd_pm(self, gen_batch_num, sample_M):
+        if self.task == "rna_old":
+            self.reward_model = LightningModel.load_from_checkpoint(
+                "/home/lix361/projects/rna_optimization/controlled_decoding_diffusion/artifacts/model:v8/model.ckpt",
+                map_location='cpu')
+        elif self.task == "rna":
+            self.reward_model = LightningModel.load_from_checkpoint(
+                "artifacts/RNA_evaluation:v0/model.ckpt",
+                map_location='cpu')
+        elif self.task == "rna_saluki":
+            common_trunk = ConvGRUTrunk(
+                stem_channels=64,
+                stem_kernel_size=15,
+                n_conv=6,
+                channel_init=64,
+                channel_mult=1,
+                kernel_size=5,
+                act_func="relu",
+                conv_norm=True,
+                pool_func=None,  # None, "max", "avg"
+                pool_size=None,
+                residual=True,  # False
+                crop_len=0,
+                n_gru=1,
+                dropout=0.1,  # 0.3
+                gru_norm=True, )
+            human_head = ConvHead(n_tasks=1, in_channels=64, act_func=None, pool_func='avg', norm=False)
+            self.reward_model = OriBaseModel(embedding=common_trunk, head=human_head)
+            ckpt_human = torch.load('/home/lix361/projects/rna_optimization/prediction_half_life/storage/ConvGRUModel_nochange_nopool_residual_ConvHeadnoactnonorm_dp0.1_lr1e-4_noclip_interbatch/epoch31/model_human.pth', map_location='cpu')
+            self.reward_model.load_state_dict(ckpt_human, strict=True)
+        else:
+            self.reward_model = LightningModel.load_from_checkpoint(
+                "artifacts/DNA_evaluation:v0/model.ckpt", map_location='cpu')
+
+        self.reward_model.to(self.device)
+        self.reward_model.eval()
+
+
+        samples = []
+        value_func_preds = []
+        reward_model_preds = []
+        for i in tqdm(range(gen_batch_num), desc="Value-weighted generation", unit="batch", dynamic_ncols=True):
+            batch_samples = self.ref_model.controlled_sample_tweedie(self.reward_model, eval_sp_size=self.NUM_SAMPLES_PER_BATCH, sample_M=sample_M, options = options, task=self.task)
+            samples.extend(batch_samples)
+            onehot_samples = self.transform_samples(batch_samples)
+            value_func_preds.extend(self.head(self.embedding(onehot_samples.float())).squeeze(2).detach())
+            if self.task == "rna_saluki":
+                pred = self.reward_model(self.transform_samples_saluki(batch_samples).float()).detach().squeeze(2)
+            elif self.n_tasks==1:
+                pred = self.reward_model(onehot_samples.float().transpose(1, 2)).detach()[:, 0]
+            else:
+                pred = self.reward_model(onehot_samples.float().transpose(1, 2)).detach()
+            reward_model_preds.extend(pred)
+
+        print("Value-weighted PM sampling done.")
+
+        return samples, torch.cat(value_func_preds), torch.cat(reward_model_preds)
     
     @torch.no_grad()
     def controlled_decode_tweedie(self, gen_batch_num, sample_M, options):
@@ -815,6 +945,102 @@ class BaseModel(nn.Module):
         '''
 
         return samples, torch.cat(value_func_preds), torch.cat(reward_model_preds), top_k_values, torch.cat(baseline_preds)
+
+    @torch.no_grad()
+    def controlled_sample_smc(
+        self,
+        reward_model,
+        alpha,
+        num_steps=None,
+        eps=1e-5,
+        eval_sp_size=None,
+        sample_M=10,
+        cvar_beta=None,
+        cvar_eta=None,
+        cvar_lambda=1.0,
+        ess_resample_ratio=1.0,
+    ):
+        """Particle SMC sampler with per-row ancestor resampling.
+
+        Returns one final sequence per batch row. Internally keeps `sample_M`
+        particles per row.
+        """
+        if eval_sp_size is None:
+            batch_size = self.config.loader.eval_batch_size
+        else:
+            batch_size = eval_sp_size
+        if self.parameterization == "ar":
+            return self._ar_sampler(batch_size)
+        if num_steps is None:
+            num_steps = self.config.sampling.steps
+
+        B = int(batch_size)
+        M = int(sample_M)
+        L = int(self.config.model.length)
+        x = self._sample_prior(B * M, L).to(self.device)
+
+        timesteps = torch.linspace(1, eps, num_steps + 1, device=self.device)
+        dt = (1 - eps) / num_steps
+        current_reward = None
+
+        # for i in range(num_steps):
+        for i in tqdm(range(num_steps), desc="SMC Steps", unit="step", dynamic_ncols=True):
+            t = timesteps[i] * torch.ones(x.shape[0], 1, device=self.device)
+            if self.sampler == "ddpm":
+                x_next, _, _, _ = self._ddpm_update_finetune(x, t, dt)
+            else:
+                x_next = self._analytic_update(x, t, dt)
+
+            sigma_s = self.noise(t - dt)[0]
+            next_reward = self._reward_x0hat_from_tokens(x_next, sigma_s, reward_model).reshape(B, M)
+            cur_reward = None if current_reward is None else current_reward.reshape(B, M)
+            logw = guided_delta_log_weight_from_reward(
+                next_reward,
+                cur_reward,
+                alpha=alpha,
+                cvar_beta=cvar_beta,
+                cvar_eta=cvar_eta,
+                cvar_lambda=cvar_lambda,
+            )
+
+            do_resample = True
+            if ess_resample_ratio < 1.0:
+                ess = effective_sample_size(logw, dim=1)
+                do_resample = bool(torch.any(ess < ess_resample_ratio * M).item())
+
+            if do_resample:
+                ancestor = resample_indices_from_log_weights(logw, num_samples=M, replacement=True)
+                x_grouped = x_next.reshape(B, M, L)
+                x = x_grouped.gather(1, ancestor[:, :, None].expand(B, M, L)).reshape(B * M, L)
+                current_reward = next_reward.gather(1, ancestor).reshape(B * M)
+            else:
+                x = x_next
+                current_reward = next_reward.reshape(B * M)
+
+        if self.config.sampling.noise_removal:
+            t = timesteps[-1] * torch.ones(x.shape[0], 1, device=self.device)
+            if self.sampler == "analytic":
+                x = self._denoiser_update(x, t)
+            else:
+                unet_conditioning = self.noise(t)[0]
+                logits = self.forward(x, unet_conditioning)
+                x = logits[:, :, :-1].argmax(dim=-1)
+
+        if current_reward is None:
+            # Fallback: no score was computed, just take the first particle per row.
+            return x.reshape(B, M, L)[:, 0, :].detach()
+
+        final_logits = guided_log_weight_from_reward(
+            current_reward.reshape(B, M),
+            alpha=alpha,
+            cvar_beta=cvar_beta,
+            cvar_eta=cvar_eta,
+            cvar_lambda=cvar_lambda,
+        )
+        final_idx = gumbel_argmax(final_logits, dim=1)
+        x_grouped = x.reshape(B, M, L)
+        out = x_grouped.gather(1, final_idx[:, None, None].expand(B, 1, L)).squeeze(1)
+        return out.detach()
 
     def configure_optimizers(self, train_config):
         # separate out all parameters to those that will and won't experience regularizing weight decay

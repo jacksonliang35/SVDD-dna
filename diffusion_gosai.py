@@ -35,6 +35,95 @@ def _sample_categorical(categorical_probs):
     - (torch.rand_like(categorical_probs) + 1e-10).log())
   return (categorical_probs / gumbel_norm).argmax(dim=-1)
 
+def _sample_gumbel_like(x, eps=1e-20):
+    u = torch.rand_like(x).clamp(min=eps, max=1.0 - eps)
+    return -torch.log(-torch.log(u))
+
+
+def _gumbel_categorical_from_logits(logits, dim=-1):
+    """
+    Exact categorical sampling:
+        idx = argmax_i(logits_i + Gumbel_i)
+
+    If logits = log probabilities up to an additive constant, this samples
+    from the corresponding categorical distribution.
+    """
+    return torch.argmax(logits + _sample_gumbel_like(logits), dim=dim)
+
+
+def _gumbel_topk_from_logits(logits, k, dim=-1):
+    """
+    Weighted sampling without replacement via Gumbel-top-k.
+    Useful for final baseline/particle selection.
+    """
+    k = min(int(k), logits.shape[dim])
+    noisy_logits = logits + _sample_gumbel_like(logits)
+    return torch.topk(noisy_logits, k=k, dim=dim).indices
+
+
+def _log_weight_from_score(
+    score,
+    alpha=1.0,
+    cvar_beta=None,
+    cvar_eta=None,
+    cvar_lambda=1.0,
+):
+    """
+    Convert reward/value score to a log sampling weight.
+
+    Risk-neutral:
+        log w = score / alpha
+
+    CVaR:
+        cost = -score
+        mixed_cost = (1 - lambda) * cost
+                   + lambda * relu(cost - eta) / (1 - beta)
+        log w = -mixed_cost / alpha
+
+    cvar_eta is in cost space.
+    """
+    if alpha is None:
+        alpha = 1.0
+    alpha = float(alpha)
+    if alpha <= 0:
+        raise ValueError(f"alpha must be positive, got {alpha}")
+
+    score = score.float()
+
+    if cvar_beta is None or cvar_eta is None:
+        return score / alpha
+
+    beta = float(cvar_beta)
+    if not (0.0 <= beta < 1.0):
+        raise ValueError(f"cvar_beta must satisfy 0 <= beta < 1, got {beta}")
+
+    lam = float(cvar_lambda)
+    if not (0.0 <= lam <= 1.0):
+        raise ValueError(f"cvar_lambda must satisfy 0 <= lambda <= 1, got {lam}")
+
+    cost = -score
+    eta = torch.as_tensor(float(cvar_eta), device=score.device, dtype=score.dtype)
+    tail_cost = torch.relu(cost - eta) / max(1.0 - beta, 1e-12)
+    mixed_cost = (1.0 - lam) * cost + lam * tail_cost
+
+    return -mixed_cost / alpha
+
+
+def _effective_sample_size_from_logw(logw, dim=-1):
+    w = torch.softmax(logw.float(), dim=dim)
+    return 1.0 / torch.sum(w * w, dim=dim).clamp_min(1e-12)
+
+
+def _torch_resample_from_logw(logw, num_samples):
+    """
+    Efficient GPU categorical resampling with replacement.
+
+    I use torch.multinomial here rather than a giant Gumbel matrix because
+    TDS/SMC may need thousands of ancestor draws. This is still probabilistic
+    resampling, just more memory efficient.
+    """
+    probs = torch.softmax(logw.float(), dim=-1)
+    return torch.multinomial(probs, num_samples=int(num_samples), replacement=True)
 
 def _unsqueeze(x, reference):
   return x.view(
