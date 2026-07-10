@@ -35,30 +35,30 @@ def _sample_categorical(categorical_probs):
     - (torch.rand_like(categorical_probs) + 1e-10).log())
   return (categorical_probs / gumbel_norm).argmax(dim=-1)
 
-def _sample_gumbel_like(x, eps=1e-20):
-    u = torch.rand_like(x).clamp(min=eps, max=1.0 - eps)
-    return -torch.log(-torch.log(u))
+# def _sample_gumbel_like(x, eps=1e-20):
+#     u = torch.rand_like(x).clamp(min=eps, max=1.0 - eps)
+#     return -torch.log(-torch.log(u))
 
 
-def _gumbel_categorical_from_logits(logits, dim=-1):
-    """
-    Exact categorical sampling:
-        idx = argmax_i(logits_i + Gumbel_i)
+# def _gumbel_categorical_from_logits(logits, dim=-1):
+#     """
+#     Exact categorical sampling:
+#         idx = argmax_i(logits_i + Gumbel_i)
 
-    If logits = log probabilities up to an additive constant, this samples
-    from the corresponding categorical distribution.
-    """
-    return torch.argmax(logits + _sample_gumbel_like(logits), dim=dim)
+#     If logits = log probabilities up to an additive constant, this samples
+#     from the corresponding categorical distribution.
+#     """
+#     return torch.argmax(logits + _sample_gumbel_like(logits), dim=dim)
 
 
-def _gumbel_topk_from_logits(logits, k, dim=-1):
-    """
-    Weighted sampling without replacement via Gumbel-top-k.
-    Useful for final baseline/particle selection.
-    """
-    k = min(int(k), logits.shape[dim])
-    noisy_logits = logits + _sample_gumbel_like(logits)
-    return torch.topk(noisy_logits, k=k, dim=dim).indices
+# def _gumbel_topk_from_logits(logits, k, dim=-1):
+#     """
+#     Weighted sampling without replacement via Gumbel-top-k.
+#     Useful for final baseline/particle selection.
+#     """
+#     k = min(int(k), logits.shape[dim])
+#     noisy_logits = logits + _sample_gumbel_like(logits)
+#     return torch.topk(noisy_logits, k=k, dim=dim).indices
 
 
 def _log_weight_from_score(
@@ -66,7 +66,7 @@ def _log_weight_from_score(
     alpha=1.0,
     cvar_beta=None,
     cvar_eta=None,
-    cvar_lambda=1.0,
+    cvar_lambda=0.0,
 ):
     """
     Convert reward/value score to a log sampling weight.
@@ -124,6 +124,119 @@ def _torch_resample_from_logw(logw, num_samples):
     """
     probs = torch.softmax(logw.float(), dim=-1)
     return torch.multinomial(probs, num_samples=int(num_samples), replacement=True)
+
+def _delta_log_weight_from_score(
+    next_score,
+    current_score=None,
+    alpha=1.0,
+    cvar_beta=None,
+    cvar_eta=None,
+    cvar_lambda=0.0,
+):
+  """Calculate the incremental SMC log potential.
+
+  When current_score is not None:
+
+      delta log w = log G(next_score) - log G(current_score)
+
+  where G is the reward potential defined by _log_weight_from_score().
+  """
+  next_log_potential = _log_weight_from_score(
+      next_score,
+      alpha=alpha,
+      cvar_beta=cvar_beta,
+      cvar_eta=cvar_eta,
+      cvar_lambda=cvar_lambda,
+  )
+
+  if current_score is None:
+    return next_log_potential
+
+  current_log_potential = _log_weight_from_score(
+      current_score,
+      alpha=alpha,
+      cvar_beta=cvar_beta,
+      cvar_eta=cvar_eta,
+      cvar_lambda=cvar_lambda,
+  )
+
+  return next_log_potential - current_log_potential
+
+
+def _normalize_log_weights(logw, dim=-1):
+  """Normalize log weights without leaving log space."""
+  return logw - torch.logsumexp(logw, dim=dim, keepdim=True)
+
+
+def _select_particle_indices_from_logw(
+    logw,
+    selection_method="resample",
+):
+  """Select one final particle per batch row.
+
+  Args:
+    logw: Tensor with shape [batch_size, num_particles].
+    selection_method:
+      - "resample": sample according to the normalized SMC weights.
+      - "max": select the particle with the largest SMC weight.
+  """
+  if logw.ndim != 2:
+    raise ValueError(
+        "logw must have shape [batch_size, num_particles], "
+        f"got {tuple(logw.shape)}"
+    )
+
+  method = str(selection_method).strip().lower()
+
+  if method in {"resample", "resampling", "sample"}:
+    return _torch_resample_from_logw(
+        logw,
+        num_samples=1,
+    ).squeeze(1)
+
+  if method in {"max", "argmax", "best"}:
+    return torch.argmax(logw, dim=1)
+
+  raise ValueError(
+      f"Unknown selection_method={selection_method!r}. "
+      "Use 'max' or 'resample'."
+  )
+  
+def _select_sample_indices_from_scores(
+    scores,
+    selection_method="max",
+    alpha=1.0,
+):
+  """Select one proposal per batch element.
+
+  Args:
+    scores: Tensor of shape [batch_size, repeats]. Larger is better.
+    selection_method:
+      - "max": current behavior, choose highest-score proposal.
+      - "resample": sample proposal with probability proportional to exp(score / alpha).
+    alpha: resampling temperature. Smaller is greedier; larger is flatter.
+
+  Returns:
+    Tensor of shape [batch_size] containing selected proposal indices.
+  """
+  if scores.ndim != 2:
+    raise ValueError(
+        f"scores must have shape [batch_size, repeats], got {scores.shape}"
+    )
+
+  method = str(selection_method).strip().lower()
+
+  if method in {"max", "argmax", "best"}:
+    return torch.argmax(scores, dim=1)
+
+  if method in {"resample", "resampling", "sample"}:
+    logw = _log_weight_from_score(scores, alpha=alpha)
+    return _torch_resample_from_logw(logw, num_samples=1).squeeze(1)
+
+  raise ValueError(
+      f"Unknown selection_method={selection_method!r}. "
+      "Use 'max' or 'resample'."
+  )
 
 def _unsqueeze(x, reference):
   return x.view(
@@ -1110,7 +1223,7 @@ class Diffusion(L.LightningModule):
     return x
 
   @torch.no_grad()
-  def controlled_sample(self, pre_scorer_embedding, pre_scorer_head, num_steps=None, eps=1e-5, eval_sp_size=None, sample_M=10):
+  def controlled_sample(self, pre_scorer_embedding, pre_scorer_head, num_steps=None, eps=1e-5, eval_sp_size=None, sample_M=10, selection_method="max", selection_alpha=1.0):
     """Generate samples from the model."""
     if eval_sp_size is None:
       batch_size_per_gpu = self.config.loader.eval_batch_size
@@ -1134,7 +1247,7 @@ class Diffusion(L.LightningModule):
       t = timesteps[i] * torch.ones(
         x.shape[0], 1, device=self.device)
       if self.sampler == 'ddpm':
-        x, x1, x2, x3 = self._ddpm_update_finetune_controlled(x, t, dt, pre_scorer_embedding, pre_scorer_head, repeats=sample_M)
+        x, x1, x2, x3 = self._ddpm_update_finetune_controlled(x, t, dt, pre_scorer_embedding, pre_scorer_head, repeats=sample_M, selection_method=selection_method, selection_alpha=selection_alpha)
       else:
         x = self._analytic_update(x, t, dt)
 
@@ -1195,7 +1308,7 @@ class Diffusion(L.LightningModule):
     return x
   
   @torch.no_grad()
-  def controlled_sample_tweedie(self, reward_model, num_steps=None, eps=1e-5, eval_sp_size=None, sample_M=10, options = True, task='dna'):
+  def controlled_sample_tweedie(self, reward_model, num_steps=None, eps=1e-5, eval_sp_size=None, sample_M=10, options="True", task='dna', selection_method="max", selection_alpha=1.0):
     """Generate samples from the model."""
     if eval_sp_size is None:
       batch_size_per_gpu = self.config.loader.eval_batch_size
@@ -1219,7 +1332,7 @@ class Diffusion(L.LightningModule):
       t = timesteps[i] * torch.ones(
         x.shape[0], 1, device=self.device)
       if self.sampler == 'ddpm':
-        x, x1, x2, x3 = self._ddpm_update_finetune_controlled_twedie(x, t, dt, reward_model, repeats=sample_M, options = options, task=task)
+        x, x1, x2, x3 = self._ddpm_update_finetune_controlled_tweedie(x, t, dt, reward_model, repeats=sample_M, options = options, task=task, selection_method=selection_method, selection_alpha=selection_alpha)
       else:
         x = self._analytic_update(x, t, dt)
 
@@ -1236,6 +1349,351 @@ class Diffusion(L.LightningModule):
         # no issue with subs; for sedd, if not using [:, :, :-1], some samples will contain the mask token
         x = logits[:, :, :-1].argmax(dim=-1)
     return x
+  
+  @torch.no_grad()
+  def _mc_value_from_tokens(self, x, pre_scorer_embedding, pre_scorer_head, time_index=None, timed=False, reward_channel=0):
+    """Evaluate the learned MC value directly on a noisy token state."""
+    value_input = self.transform_samples(x).float()
+
+    if timed:
+      if time_index is None:
+        raise ValueError("time_index is required when mc_timed=True")
+      time_indices = torch.full(x.shape, int(time_index), device=x.device, dtype=torch.long)
+      value = pre_scorer_head(pre_scorer_embedding(value_input, time_indices))
+    else:
+      value = pre_scorer_head(pre_scorer_embedding(value_input))
+
+    if isinstance(value, (tuple, list)):
+      value = value[0]
+
+    value = value.reshape(x.shape[0], -1)
+    channel = int(reward_channel)
+
+    if not 0 <= channel < value.shape[1]:
+      raise ValueError(f"reward_channel={channel} is invalid for MC value shape {tuple(value.shape)}")
+
+    return value[:, channel].float()
+  
+  @torch.no_grad()
+  def _reward_from_x0_prediction(self, tokens, log_p_x0, reward_model, task="dna", reward_channel=0, x0_mode="soft"):
+    """Score the PM/Tweedie estimate of x0 for each particle.
+
+    Args:
+      tokens:
+        Current discrete state, with shape [num_particles, seq_length].
+
+      log_p_x0:
+        Model prediction at the current diffusion time, with shape
+        [num_particles, seq_length, vocab_size].
+
+      reward_model:
+        DNA/RNA reward model.
+
+      task:
+        "dna" or "rna_saluki".
+
+      reward_channel:
+        Output channel to maximize. DNA currently uses channel zero.
+
+      x0_mode:
+        "soft":
+          Feed the predicted base probabilities to the reward model.
+          This is the closest discrete analogue of predict_x0_from_xt
+          in the image implementation.
+
+        "hard":
+          Convert the prediction to an argmax one-hot sequence.
+          This matches the current DNA Tweedie implementation more
+          closely.
+    """
+    if tokens.ndim != 2:
+      raise ValueError(
+          f"tokens must have shape [N, L], got {tuple(tokens.shape)}"
+      )
+
+    if log_p_x0.ndim != 3:
+      raise ValueError(
+          "log_p_x0 must have shape [N, L, vocab_size], "
+          f"got {tuple(log_p_x0.shape)}"
+      )
+
+    # Base indices are 0, ..., mask_index - 1. Exclude the mask class.
+    base_logits = log_p_x0[:, :, :self.mask_index].float()
+    mode = str(x0_mode).strip().lower()
+
+    if mode in {"soft", "mean", "expectation"}:
+      # Posterior-mean representation in one-hot space.
+      x0_hat = torch.softmax(base_logits, dim=-1)
+
+    elif mode in {"hard", "argmax", "map"}:
+      predicted_tokens = base_logits.argmax(dim=-1)
+      x0_hat = F.one_hot(
+          predicted_tokens,
+          num_classes=self.mask_index,
+      ).float()
+
+    else:
+      raise ValueError(
+          f"Unknown x0_mode={x0_mode!r}. Use 'soft' or 'hard'."
+      )
+
+    # Already revealed bases must remain fixed.
+    observed = tokens != self.mask_index
+
+    # Replace mask indices before one-hot encoding. These entries are
+    # ignored by torch.where below.
+    safe_tokens = tokens.masked_fill(~observed, 0)
+
+    observed_onehot = F.one_hot(safe_tokens, num_classes=self.mask_index).float()
+
+    x0_hat = torch.where(observed[:, :, None], observed_onehot, x0_hat)
+
+    if task == "rna_saluki":
+      reward_input = self.transform_samples_saluki(x0_hat).float()
+    else:
+      # Existing DNA oracle convention: [batch, 4, length].
+      reward_input = x0_hat.transpose(1, 2).float()
+
+    reward = reward_model(reward_input)
+
+    # Support models that return (reward, auxiliary_output).
+    if isinstance(reward, (tuple, list)):
+      reward = reward[0]
+
+    if not torch.is_tensor(reward):
+      reward = torch.as_tensor(reward, device=tokens.device)
+
+    if reward.ndim == 0 or reward.shape[0] != tokens.shape[0]:
+      raise ValueError(
+          "reward_model must return one row per particle; "
+          f"got shape {tuple(reward.shape)} for "
+          f"{tokens.shape[0]} particles"
+      )
+
+    reward = reward.reshape(tokens.shape[0], -1)
+    channel = int(reward_channel)
+
+    if not (0 <= channel < reward.shape[1]):
+      raise ValueError(
+          f"reward_channel={channel} is invalid for "
+          f"reward shape {tuple(reward.shape)}"
+      )
+
+    return reward[:, channel].float()
+  
+  @torch.no_grad()
+  def controlled_sample_smc(self, alpha, num_steps=None, eps=1e-5, eval_sp_size=None,
+      cvar_beta=None, cvar_eta=None, cvar_lambda=0.0, ess_resample_ratio=0.5, resampling_method="ess",
+      selection_method="resample", variant="PM", reward_model=None, pre_scorer_embedding=None, pre_scorer_head=None,
+      mc_timed=False,task="dna", reward_channel=0, x0_mode="soft", return_diagnostics=False
+  ):
+    """SMC sampler adapted from SVDD-image's sample_smc.
+
+    Maintains B independent particle populations, with M particles in
+    each population, and returns one final sequence per population.
+
+    Args:
+      reward_model:
+        Model used to score the predicted clean sequence.
+
+      alpha:
+        Reward temperature used in the SMC potential.
+
+      cvar_beta, cvar_eta, cvar_lambda:
+        Optional CVaR parameters accepted by
+        _log_weight_from_score(). cvar_eta is in cost space.
+
+      ess_resample_ratio:
+        ESS resampling threshold as a fraction of M. The image CVaR
+        implementation uses 0.5.
+
+      resampling_method:
+        "ess":
+          Accumulate weights and resample when ESS falls below
+          ess_resample_ratio * M. This matches sample_smc in
+          sd_pipeline_cvar.py.
+
+        "always":
+          Resample after every non-final step. This matches the older
+          SMC_SDPipeline in sd_pipeline.py.
+
+      selection_method:
+        "resample":
+          Perform final weighted resampling. This is the reference SMC
+          behavior.
+
+        "max":
+          Return the highest-weight final particle. This is an optional
+          diagnostic mode and is not the reference SMC behavior.
+
+      x0_mode:
+        "soft" for the closest image-PM analogue, or "hard" to match the
+        current DNA Tweedie approximation.
+
+      return_diagnostics:
+        When True, return (samples, diagnostics).
+    """
+    if eval_sp_size is None:
+      batch_size = self.config.loader.eval_batch_size
+    else:
+      batch_size = eval_sp_size
+
+    if self.parameterization == "ar":
+      return self._ar_sampler(batch_size)
+
+    # The reference image SMC is a DDIM/DDPM-style particle transition.
+    if self.sampler != "ddpm":
+      raise NotImplementedError(
+          "The SVDD-image-style SMC path currently requires "
+          f"sampler='ddpm', got {self.sampler!r}."
+      )
+
+    if num_steps is None:
+      num_steps = self.config.sampling.steps
+    
+    variant = str(variant).strip().upper()
+
+    if variant not in {"PM", "MC"}:
+      raise ValueError(f"variant must be 'PM' or 'MC', got {variant!r}")
+
+    if variant == "PM" and reward_model is None:
+      raise ValueError("reward_model is required for variant='PM'")
+
+    if variant == "MC" and (pre_scorer_embedding is None or pre_scorer_head is None):
+      raise ValueError("pre_scorer_embedding and pre_scorer_head are required for variant='MC'")
+
+    B = int(batch_size)
+    L = int(self.config.model.length)
+    num_steps = int(num_steps)
+    alpha = float(alpha)
+    ess_resample_ratio = float(ess_resample_ratio)
+
+    if (cvar_beta is None) != (cvar_eta is None):
+      raise ValueError(
+          "cvar_beta and cvar_eta must either both be set "
+          "or both be None"
+      )
+
+    resampling_method = str(resampling_method).strip().lower()
+
+    if resampling_method not in {"ess", "always"}:
+      raise ValueError(
+          "resampling_method must be 'ess' or 'always', got "
+          f"{resampling_method!r}"
+      )
+
+    selection_method = str(selection_method).strip().lower()
+
+    # ---------------------------------------------------------------
+    # Each output row has its own population of M particles.
+    # ---------------------------------------------------------------
+    x = self._sample_prior(B, L).to(self.device)
+    timesteps = torch.linspace(1, eps, num_steps + 1, device=self.device)
+    dt = (1 - eps) / num_steps
+
+    # Accumulated weights since the most recent ancestor resampling.
+    smc_log_weights = torch.zeros(B, device=self.device,dtype=torch.float32)
+    ess_history = []
+    resampled_history = []
+
+    for i in tqdm(range(num_steps), desc="SMC steps", unit="step", leave=False, dynamic_ncols=True):
+      t = timesteps[i] * torch.ones(B, 1, device=self.device)
+
+      # -------------------------------------------------------------
+      # All non-final steps:
+      #
+      # old potential -> propagate -> new potential -> reweight
+      # -------------------------------------------------------------
+      if i < num_steps - 1:
+        t_next = timesteps[i + 1] * torch.ones(B, 1, device=self.device)
+
+        x_candidate, old_reward, new_reward = self._ddpm_update_finetune_smc(
+          x, t, t_next, reward_model=reward_model, variant=variant, pre_scorer_embedding=pre_scorer_embedding, 
+          pre_scorer_head=pre_scorer_head, old_mc_step=max(i-1, 0), 
+          new_mc_step=i, mc_timed=mc_timed, task=task, reward_channel=reward_channel, x0_mode=x0_mode
+        )
+        
+        old_log_potential = _log_weight_from_score(
+            old_reward, alpha=alpha, cvar_beta=cvar_beta, cvar_eta=cvar_eta, cvar_lambda=cvar_lambda
+        )
+
+        new_log_potential = _log_weight_from_score(
+            new_reward, alpha=alpha, cvar_beta=cvar_beta, cvar_eta=cvar_eta, cvar_lambda=cvar_lambda,
+        )
+
+        incremental_log_weights = new_log_potential - old_log_potential
+
+        # Retain prior weights when a population was not resampled at
+        # an earlier step.
+        candidate_log_weights = smc_log_weights + incremental_log_weights
+
+        # -----------------------------------------------------------
+        # Compute ESS independently for every output row.
+        # -----------------------------------------------------------
+        ess = _effective_sample_size_from_logw(candidate_log_weights, dim=0)
+        ess_history.append(ess.detach().cpu())
+
+        if resampling_method == "always":
+          resample_now = True
+        else:
+          resample_now = bool((ess < ess_resample_ratio * B).item())
+
+        resampled_history.append(resample_now)
+
+        if resample_now:
+          ancestor_indices = _torch_resample_from_logw(candidate_log_weights, num_samples=B)
+          x = x_candidate.index_select(0, ancestor_indices).detach()
+          smc_log_weights = torch.zeros_like(candidate_log_weights)
+        else:
+          x = x_candidate.detach()
+          smc_log_weights = candidate_log_weights
+
+      else:
+        # The final diffusion step is propagated without another
+        # potential calculation or intermediate resampling.
+        x, _, _, _ = self._ddpm_update_finetune(x, t, dt)
+
+    # ---------------------------------------------------------------
+    # Final ESS and final population resampling.
+    # ---------------------------------------------------------------
+    final_ess = _effective_sample_size_from_logw(smc_log_weights, dim=0)
+    ess_history.append(final_ess.detach().cpu())
+
+    final_probs = torch.softmax(smc_log_weights.float(), dim=0)
+    uniform_probs = torch.full_like(final_probs, 1.0 / B)
+
+    if not torch.allclose(final_probs, uniform_probs, rtol=1e-5, atol=1e-8):
+      final_indices = _torch_resample_from_logw(smc_log_weights, num_samples=B)
+      x = x.index_select(0, final_indices).detach()
+      smc_log_weights = torch.zeros_like(smc_log_weights)
+
+    # ---------------------------------------------------------------
+    # Remove any remaining mask tokens.
+    # ---------------------------------------------------------------
+    if self.config.sampling.noise_removal:
+      t = timesteps[-1] * torch.ones(x.shape[0], 1, device=self.device)
+
+      if self.sampler == "analytic":
+        x = self._denoiser_update(x, t)
+      else:
+        unet_conditioning = self.noise(t)[0]
+        logits = self.forward(x, unet_conditioning)
+        x = logits[:, :, :-1].argmax(dim=-1)
+
+    x = x.detach()
+
+    if not return_diagnostics:
+      return x
+
+    ess_tensor = torch.stack(ess_history)
+    diagnostics = {
+        "ess": ess_tensor,
+        "normalized_ess": ess_tensor / B,
+        "resampled": torch.tensor(resampled_history, dtype=torch.bool),
+        "min_normalized_ess": float((ess_tensor / B).min().item()),
+    }
+
+    return x, diagnostics
 
   @torch.no_grad()
   def _ddpm_update_finetune(self, x, t, dt):
@@ -1265,7 +1723,7 @@ class Diffusion(L.LightningModule):
     return copy_flag * x + (1 - copy_flag) * _x, x, q_xs, copy_flag
 
   @torch.no_grad()
-  def _ddpm_update_finetune_controlled(self, x, t, dt, pre_scorer_embedding, pre_scorer_head, repeats=10):
+  def _ddpm_update_finetune_controlled(self, x, t, dt, pre_scorer_embedding, pre_scorer_head, repeats=10, selection_method="max", selection_alpha=1.0):
     sigma_t, _ = self.noise(t)
     sigma_s, _ = self.noise(t - dt)
     if sigma_t.ndim > 1:
@@ -1299,7 +1757,7 @@ class Diffusion(L.LightningModule):
     scores = []
     for i in range(repeats):
       pre_scorer_input = pre_scorer_embedding(self.transform_samples(samples[i]).float())  # Customize this part based on your pre_scorer input requirements
-      scores.append(pre_scorer_head(pre_scorer_input).squeeze())
+      scores.append(pre_scorer_head(pre_scorer_input).reshape(x.size(0)))
 
     # scores = torch.softmax(scores, dim=0)  # Convert scores to probabilities
     # # Sample from the weighted categorical distribution formed by scores
@@ -1308,16 +1766,27 @@ class Diffusion(L.LightningModule):
     # final_samples = samples[final_sample_indices]
     # # copy_flag = (x != self.mask_index).to(x.dtype)
 
-    # scores = pre_scorer_head(pre_scorer_input).view(x.size(0), 10)  # Reshape scores to [batch_size, 10]
-    scores = torch.stack(scores, dim=1)
-    scores = torch.softmax(scores, dim=1)  # Convert scores to probabilities for each batch
+    # # scores = pre_scorer_head(pre_scorer_input).view(x.size(0), 10)  # Reshape scores to [batch_size, 10]
+    # scores = torch.stack(scores, dim=1)
+    # scores = torch.softmax(scores, dim=1)  # Convert scores to probabilities for each batch
 
-    # # Sample from the weighted categorical distribution formed by scores
-    # final_sample_indices = torch.multinomial(scores, 1).squeeze(1)  # Shape [batch_size]
-    # Select the index of the highest score for each batch
-    final_sample_indices = torch.argmax(scores, dim=1).squeeze()  # Shape [batch_size]
-    final_samples = [samples[final_sample_indices[j]][j,:] for j in range(x.size(0))]  # Select the chosen samples using gathered indices
-    final_samples = torch.stack(final_samples, dim=0)
+    # # # Sample from the weighted categorical distribution formed by scores
+    # # final_sample_indices = torch.multinomial(scores, 1).squeeze(1)  # Shape [batch_size]
+    # # Select the index of the highest score for each batch
+    # final_sample_indices = torch.argmax(scores, dim=1).squeeze()  # Shape [batch_size]
+    # final_samples = [samples[final_sample_indices[j]][j,:] for j in range(x.size(0))]  # Select the chosen samples using gathered indices
+    # final_samples = torch.stack(final_samples, dim=0)
+    scores = torch.stack(scores, dim=1)  # Shape [batch_size, repeats]
+
+    final_sample_indices = _select_sample_indices_from_scores(
+        scores,
+        selection_method=selection_method,
+        alpha=selection_alpha,
+    )  # Shape [batch_size]
+
+    samples_tensor = torch.stack(samples, dim=1)  # Shape [batch_size, repeats, seq_length]
+    batch_indices = torch.arange(x.size(0), device=x.device)
+    final_samples = samples_tensor[batch_indices, final_sample_indices]
     return final_samples, x, q_xs, copy_flag
 
   @torch.no_grad()
@@ -1464,7 +1933,7 @@ class Diffusion(L.LightningModule):
     return x_grad
   
   @torch.no_grad()
-  def _ddpm_update_finetune_controlled_twedie(self, x, t, dt, reward_model, repeats=10, options = "True", task="dna"):
+  def _ddpm_update_finetune_controlled_tweedie(self, x, t, dt, reward_model, repeats=10, options = "True", task="dna", selection_method="max", selection_alpha=1.0):
     sigma_t, _ = self.noise(t)
     sigma_s, _ = self.noise(t - dt)
     if sigma_t.ndim > 1:
@@ -1504,13 +1973,13 @@ class Diffusion(L.LightningModule):
 
     scores = []
     for i in range(repeats):
-      if options == "True": # Use Tweedie's formula. Aim to calcuate r(E[x_0|x_t])
+      if str(options).lower() == "true": # Use Tweedie's formula. Aim to calcuate r(E[x_0|x_t])
         expected_x0 = self.forward(samples[i], sigma_s) # Calcualte E[x_0|x_t]
         expected_x0_arg = torch.argmax(expected_x0,dim=2)
         expected_x0_onehot = torch.nn.functional.one_hot(expected_x0_arg)
         copy_next_flag = (samples[i] != self.mask_index).to(x.dtype)
         expected_x0_onehot = copy_next_flag[:, :, None] * torch.nn.functional.one_hot(samples[i])[:, :, 0:4] + (1 - copy_next_flag[:, :, None]) * expected_x0_onehot  
-      else: # Use heuristc to make masked sequnce to be 0. I think you used this one before?
+      else: # Use heuristic to make masked sequence to be 0. I think you used this one before?
         raw_seq = torch.nn.functional.one_hot(samples[i], 5)
         raw_seq = raw_seq[:,:,0:4]
         copy_flag = (samples[i] != self.mask_index).to(raw_seq.dtype)
@@ -1526,7 +1995,7 @@ class Diffusion(L.LightningModule):
         #reward_pes1 = torch.clamp(5.0*(threshold - scorer1),max=1.0)
         #reward_pes2 = torch.clamp(5.0*(threshold -  scorer2),max=1.0)
         scorer = scorer0 #- 1.0 * ( scorer1 + scorer2 )  ###+  torch.log(torch.clamp(reward_pes1,min= 1e-40) ) + torch.log(torch.clamp(reward_pes2,min= 1e-40) ) 
-      scores.append(scorer.squeeze())
+      scores.append(scorer.reshape(x.size(0)))
 
       #######################################
       #######################################
@@ -1540,17 +2009,98 @@ class Diffusion(L.LightningModule):
     # final_samples = samples[final_sample_indices]
     # # copy_flag = (x != self.mask_index).to(x.dtype)
 
-    # scores = pre_scorer_head(pre_scorer_input).view(x.size(0), 10)  # Reshape scores to [batch_size, 10]
-    scores = torch.stack(scores, dim=1)
-    scores = torch.softmax(scores, dim=1)  # Convert scores to probabilities for each batch
+    # # scores = pre_scorer_head(pre_scorer_input).view(x.size(0), 10)  # Reshape scores to [batch_size, 10]
+    # scores = torch.stack(scores, dim=1)
+    # scores = torch.softmax(scores, dim=1)  # Convert scores to probabilities for each batch
 
-    # # Sample from the weighted categorical distribution formed by scores
-    # final_sample_indices = torch.multinomial(scores, 1).squeeze(1)  # Shape [batch_size]
-    # Select the index of the highest score for each batch
-    final_sample_indices = torch.argmax(scores, dim=1).squeeze()  # Shape [batch_size]
-    final_samples = [samples[final_sample_indices[j]][j,:] for j in range(x.size(0))]  # Select the chosen samples using gathered indices
-    final_samples = torch.stack(final_samples, dim=0)
+    # # # Sample from the weighted categorical distribution formed by scores
+    # # final_sample_indices = torch.multinomial(scores, 1).squeeze(1)  # Shape [batch_size]
+    # # Select the index of the highest score for each batch
+    # final_sample_indices = torch.argmax(scores, dim=1).squeeze()  # Shape [batch_size]
+    # final_samples = [samples[final_sample_indices[j]][j,:] for j in range(x.size(0))]  # Select the chosen samples using gathered indices
+    # final_samples = torch.stack(final_samples, dim=0)
+
+    scores = torch.stack(scores, dim=1)  # Shape [batch_size, repeats]
+
+    final_sample_indices = _select_sample_indices_from_scores(
+        scores,
+        selection_method=selection_method,
+        alpha=selection_alpha,
+    )  # Shape [batch_size]
+
+    samples_tensor = torch.stack(samples, dim=1)  # Shape [batch_size, repeats, seq_length]
+    batch_indices = torch.arange(x.size(0), device=x.device)
+    final_samples = samples_tensor[batch_indices, final_sample_indices]
     return final_samples, x, q_xs, copy_flag
+
+  @torch.no_grad()
+  def _ddpm_update_finetune_smc(self, x, t, t_next, reward_model=None, variant="PM", 
+      pre_scorer_embedding=None, pre_scorer_head=None, old_mc_step=None, new_mc_step=None, mc_timed=False, 
+      task="dna", reward_channel=0, x0_mode="soft"
+    ):
+    """Propagate each particle once and evaluate the old and new SMC scores."""
+    variant = str(variant).strip().upper()
+
+    if variant not in {"PM", "MC"}:
+      raise ValueError(f"variant must be 'PM' or 'MC', got {variant!r}")
+
+    if variant == "PM" and reward_model is None:
+      raise ValueError("reward_model is required for variant='PM'")
+
+    if variant == "MC" and (pre_scorer_embedding is None or pre_scorer_head is None):
+      raise ValueError("pre_scorer_embedding and pre_scorer_head are required for variant='MC'")
+
+    sigma_t, _ = self.noise(t)
+    sigma_next, _ = self.noise(t_next)
+
+    if sigma_t.ndim > 1:
+      sigma_t = sigma_t.squeeze(-1)
+
+    if sigma_next.ndim > 1:
+      sigma_next = sigma_next.squeeze(-1)
+
+    assert sigma_t.ndim == 1, sigma_t.shape
+    assert sigma_next.ndim == 1, sigma_next.shape
+
+    move_chance_t = (1 - torch.exp(-sigma_t))[:, None, None]
+    move_chance_next = (1 - torch.exp(-sigma_next))[:, None, None]
+
+    # The current diffusion prediction is always required to construct
+    # the transition. PM also uses it to evaluate the old x0 estimate.
+    log_p_x0_t = self.forward(x, sigma_t)
+    assert move_chance_t.ndim == log_p_x0_t.ndim
+
+    if variant == "PM":
+      old_reward = self._reward_from_x0_prediction(
+        x, log_p_x0_t, reward_model, task=task, reward_channel=reward_channel, x0_mode=x0_mode
+      )
+    else:
+      old_reward = self._mc_value_from_tokens(
+        x, pre_scorer_embedding, pre_scorer_head, time_index=old_mc_step, timed=mc_timed, reward_channel=reward_channel
+      )
+
+    # Propagate every particle once.
+    q_xnext = log_p_x0_t.exp() * (move_chance_t - move_chance_next)
+    q_xnext[:, :, self.mask_index] = move_chance_next[:, :, 0]
+
+    proposed_tokens = _sample_categorical(q_xnext)
+    copy_flag = (x != self.mask_index).to(x.dtype)
+    x_candidate = copy_flag * x + (1 - copy_flag) * proposed_tokens
+
+    if variant == "PM":
+      # PM requires a new diffusion prediction at the candidate state
+      # to construct its next predicted x0.
+      log_p_x0_next = self.forward(x_candidate, sigma_next)
+      new_reward = self._reward_from_x0_prediction(
+        x_candidate, log_p_x0_next, reward_model, task=task, reward_channel=reward_channel, x0_mode=x0_mode
+      )
+    else:
+      # MC evaluates the learned value directly on the candidate state.
+      new_reward = self._mc_value_from_tokens(
+        x_candidate, pre_scorer_embedding, pre_scorer_head, time_index=new_mc_step, timed=mc_timed, reward_channel=reward_channel
+      )
+
+    return x_candidate, old_reward.reshape(x.shape[0]), new_reward.reshape(x.shape[0])
 
   def transform_samples(self, samples, num_classes=4):
     # One-hot encode the tensor but first mask out the '4's

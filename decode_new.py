@@ -228,7 +228,7 @@ def reward_predict(model, reward_model, token_batch: torch.Tensor, n_tasks: int)
 
 
 @torch.no_grad()
-def controlled_decode_local(model, gen_batch_num: int, sample_M: int, n_tasks: int, variant: str = "MC", show_progress: bool = True):
+def controlled_decode_local(model, gen_batch_num: int, sample_M: int, n_tasks: int, variant: str = "MC", method: str = "max", alpha: float = 1.0, sample_baseline: bool = False, show_progress: bool = True):
     """
     Controlled decoding with tqdm.
 
@@ -256,7 +256,7 @@ def controlled_decode_local(model, gen_batch_num: int, sample_M: int, n_tasks: i
     reward_model.eval()
 
     samples = []
-    value_func_preds = []
+    # value_func_preds = []
     reward_model_preds = []
 
     task_l = getattr(model, "task", "").lower()
@@ -270,64 +270,173 @@ def controlled_decode_local(model, gen_batch_num: int, sample_M: int, n_tasks: i
                 model.head,
                 eval_sp_size=model.NUM_SAMPLES_PER_BATCH,
                 sample_M=sample_M,
+                selection_method=method,
+                selection_alpha=alpha,
             )
         else:  # variant == "PM"
             batch_samples = model.ref_model.controlled_sample_tweedie(
                 reward_model,
                 eval_sp_size=model.NUM_SAMPLES_PER_BATCH,
                 sample_M=sample_M,
+                options="True",
                 task=tweedie_task,
+                selection_method=method,
+                selection_alpha=alpha,
             )
 
         samples.append(batch_samples.detach())
 
-        pred, onehot_samples = reward_predict(model, reward_model, batch_samples, n_tasks)
+        pred, _ = reward_predict(model, reward_model, batch_samples, n_tasks)
 
-        if variant == "MC":
-            value = model.head(
-                model.embedding(onehot_samples.float())
-            ).squeeze(2).detach().reshape(-1)
-        else:
-            # PM uses reward feedback directly, not a separately trained value head.
-            # Keep the saved .npz schema unchanged.
-            value = pred.detach().reshape(-1)
+        # if variant == "MC":
+        #     value = model.head(
+        #         model.embedding(onehot_samples.float())
+        #     ).squeeze(2).detach().reshape(-1)
+        # else:
+        #     # PM uses reward feedback directly, not a separately trained value head.
+        #     # Keep the saved .npz schema unchanged.
+        #     value = pred.detach().reshape(-1)
 
-        value_func_preds.append(value)
+        # value_func_preds.append(value)
+
         reward_model_preds.append(pred)
 
     print(f"{variant} guided sampling done.")
 
-    baseline_preds = []
-    all_preds = []
+    if sample_baseline:
+        baseline_preds = []
+        all_preds = []
 
-    for i in tqdm(
-        range(gen_batch_num * sample_M),
-        desc="Baseline generation",
-        unit="batch",
-        dynamic_ncols=True,
-        disable=not show_progress,
+        for i in tqdm(
+            range(gen_batch_num * sample_M),
+            desc="Baseline generation",
+            unit="batch",
+            dynamic_ncols=True,
+            disable=not show_progress,
+        ):
+            batch = model.ref_model.decode_sample(eval_sp_size=model.NUM_SAMPLES_PER_BATCH)
+            pred, _ = reward_predict(model, reward_model, batch, n_tasks)
+
+            if i < gen_batch_num:
+                baseline_preds.append(pred)
+            all_preds.append(pred)
+
+        print("Baseline sampling done.")
+
+        all_values = torch.cat(all_preds)
+        k = int(len(all_values) / sample_M)
+        top_k_values, _ = torch.topk(all_values, k)
+
+        return (
+            samples,
+            # torch.cat(value_func_preds),
+            torch.cat(reward_model_preds),
+            top_k_values,
+            torch.cat(baseline_preds),
+        )
+    
+    else:
+        # return samples, torch.cat(value_func_preds), torch.cat(reward_model_preds)
+        return samples, torch.cat(reward_model_preds)
+
+@torch.no_grad()
+def controlled_decode_smc_local(model, gen_batch_num: int, n_tasks: int, alpha: float, variant: str = "MC", 
+        num_steps=None, ess_resample_ratio: float = 0.5, resampling_method: str = "ess", x0_mode: str = "soft", 
+        reward_channel: int = 0, mc_timed=None, sample_baseline: bool = False, show_progress: bool = True
     ):
-        batch = model.ref_model.decode_sample(eval_sp_size=model.NUM_SAMPLES_PER_BATCH)
-        pred, _ = reward_predict(model, reward_model, batch, n_tasks)
+    """Run one global SMC population per generated batch and preserve the existing decode return schema."""
+    variant = variant.upper()
 
-        if i < gen_batch_num:
-            baseline_preds.append(pred)
-        all_preds.append(pred)
+    if variant not in {"MC", "PM"}:
+        raise ValueError(f"variant must be 'MC' or 'PM', got: {variant!r}")
+    if gen_batch_num < 1:
+        raise ValueError(f"gen_batch_num must be positive, got: {gen_batch_num}")
+    if alpha <= 0:
+        raise ValueError(f"alpha must be positive, got: {alpha}")
+    if not hasattr(model, "ref_model"):
+        raise AttributeError("The constructed model does not have ref_model; cannot decode.")
+    if not hasattr(model, "reward_model"):
+        raise AttributeError("The constructed model does not have reward_model; cannot score samples.")
+    if not hasattr(model.ref_model, "controlled_sample_smc"):
+        raise AttributeError("ref_model does not have controlled_sample_smc; add it to diffusion_gosai.py first.")
+    if variant == "MC" and not hasattr(model.ref_model, "_mc_value_from_tokens"):
+        raise AttributeError("ref_model does not have _mc_value_from_tokens; add the MC helper to diffusion_gosai.py first.")
 
-    print("Baseline sampling done.")
+    reward_model = model.reward_model
+    mc_timed = bool(getattr(model, "timed", False)) if mc_timed is None else bool(mc_timed)
+    task_l = getattr(model, "task", "").lower()
+    smc_task = "rna_saluki" if task_l == "rna_saluki" else "dna"
+    smc_steps = int(num_steps) if num_steps is not None else int(model.ref_model.config.sampling.steps)
 
-    all_values = torch.cat(all_preds)
-    k = int(len(all_values) / sample_M)
-    top_k_values, _ = torch.topk(all_values, k)
+    model.eval()
+    model.ref_model.eval()
+    reward_model.eval()
 
-    return (
-        samples,
-        torch.cat(value_func_preds),
-        torch.cat(reward_model_preds),
-        top_k_values,
-        torch.cat(baseline_preds),
-    )
+    samples = []
+    # value_func_preds = []
+    reward_model_preds = []
 
+    for _ in tqdm(range(gen_batch_num), desc=f"SMC-{variant} guided generation", unit="population", dynamic_ncols=True, disable=not show_progress):
+        batch_samples = model.ref_model.controlled_sample_smc(
+            reward_model=reward_model,
+            alpha=alpha,
+            num_steps=num_steps,
+            eval_sp_size=model.NUM_SAMPLES_PER_BATCH,
+            ess_resample_ratio=ess_resample_ratio,
+            resampling_method=resampling_method,
+            variant=variant,
+            pre_scorer_embedding=model.embedding if variant == "MC" else None,
+            pre_scorer_head=model.head if variant == "MC" else None,
+            mc_timed=mc_timed,
+            task=smc_task,
+            reward_channel=reward_channel,
+            x0_mode=x0_mode,
+        )
+
+        samples.append(batch_samples.detach())
+        pred, _ = reward_predict(model, reward_model, batch_samples, n_tasks)
+
+        # if variant == "MC":
+        #     final_mc_index = smc_steps - 1 if mc_timed else None
+        #     value = model.ref_model._mc_value_from_tokens(
+        #         batch_samples,
+        #         model.embedding,
+        #         model.head,
+        #         time_index=final_mc_index,
+        #         timed=mc_timed,
+        #         reward_channel=reward_channel,
+        #     ).detach().reshape(-1)
+        # else:
+        #     value = pred.detach().reshape(-1)
+
+        # value_func_preds.append(value)
+        reward_model_preds.append(pred)
+
+    print(f"SMC-{variant} guided sampling done.")
+
+    if sample_baseline:
+        baseline_preds = []
+        all_preds = []
+
+        for i in tqdm(range(gen_batch_num), desc="Baseline generation", unit="batch", dynamic_ncols=True, disable=not show_progress):
+            batch = model.ref_model.decode_sample(eval_sp_size=model.NUM_SAMPLES_PER_BATCH)
+            pred, _ = reward_predict(model, reward_model, batch, n_tasks)
+
+            if i < gen_batch_num:
+                baseline_preds.append(pred)
+
+            all_preds.append(pred)
+
+        print("Baseline sampling done.")
+
+        all_values = torch.cat(all_preds)
+
+        # return samples, torch.cat(value_func_preds), torch.cat(reward_model_preds), top_k_values, torch.cat(baseline_preds)
+        return samples, torch.cat(reward_model_preds), all_values, torch.cat(baseline_preds)
+    
+    else:
+        # return samples, torch.cat(value_func_preds), torch.cat(reward_model_preds)
+        return samples, torch.cat(reward_model_preds)
 
 def tensor_list_to_numpy(samples):
     if not samples:
@@ -372,34 +481,77 @@ def run(args) -> Path:
     print("Using device:", device)
 
     model.eval()
+    if args.sampler == "svdd_max":
 
-    gen_samples, value_func_preds, reward_model_preds, selected_baseline_preds, baseline_preds = controlled_decode_local(
-        model=model,
-        gen_batch_num=args.val_batch_num,
-        sample_M=args.sample_M,
-        n_tasks=args.n_task,
-        variant=args.variant,
-        show_progress=not args.no_tqdm,
-    )
+        print(f"Using {args.sampler} sampler with {args.variant} variant")
+
+        gen_samples, reward_model_preds = controlled_decode_local(
+            model=model,
+            gen_batch_num=args.val_batch_num,
+            sample_M=args.sample_M,
+            n_tasks=args.n_task,
+            variant=args.variant,
+            method="max",
+            alpha=1.0,      # Does not matter for max selection, but still needs to be passed
+            show_progress=not args.no_tqdm,
+        )
+    elif args.sampler == "svdd":
+
+        print(f"Using {args.sampler} sampler with alpha={args.alpha} and {args.variant} variant")
+
+        gen_samples, reward_model_preds = controlled_decode_local(
+            model=model,
+            gen_batch_num=args.val_batch_num,
+            sample_M=args.sample_M,
+            n_tasks=args.n_task,
+            variant=args.variant,
+            method="resample",
+            alpha=args.alpha,
+            show_progress=not args.no_tqdm,
+        )
+    elif args.sampler == "smc":
+
+        print(f"Using {args.sampler} sampler with alpha={args.alpha} and {args.variant} variant")
+
+        gen_samples, reward_model_preds = controlled_decode_smc_local(
+            model=model,
+            gen_batch_num=args.val_batch_num,
+            n_tasks=args.n_task,
+            alpha=args.alpha,
+            variant=args.variant,
+            ess_resample_ratio=.5,
+            resampling_method="ess",
+            x0_mode=args.x0_mode,
+            show_progress=not args.no_tqdm,
+        )
+    else:
+        raise ValueError(f"Unknown sampler: {args.sampler}")
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    out_name = args.output_name or f"{args.task}-{args.reward_name}-{args.sampler}-{args.variant}.npz"
+    out_name = args.output_name or f"{args.task}-{args.sampler}-{args.variant}-M{args.batch_size if args.sampler == 'smc' else args.sample_M}-S{args.seed}.npz"
     if not out_name.endswith(".npz"):
         out_name += ".npz"
     out_path = out_dir / out_name
 
     arrays: Dict[str, np.ndarray] = {
-        "decoding": reward_model_preds.detach().cpu().numpy(),
-        "baseline": baseline_preds.detach().cpu().numpy(),
-        "value_func": value_func_preds.detach().cpu().numpy(),
-        "selected_baseline": selected_baseline_preds.detach().cpu().numpy(),
+        "reward": reward_model_preds.detach().cpu().numpy(),
+        # "baseline": baseline_preds.detach().cpu().numpy(),
+        # "value_func": value_func_preds.detach().cpu().numpy(),
+        # "selected_baseline": selected_baseline_preds.detach().cpu().numpy(),
     }
     if args.save_samples:
-        arrays["sample_tokens"] = tensor_list_to_numpy(gen_samples)
+        arrays["sample"] = tensor_list_to_numpy(gen_samples)
+    
+    print("Reward:", arrays["reward"])
+    print("Reward mean:", np.mean(arrays["reward"]))
+    print("Reward std:", np.std(arrays["reward"]))
+    print("Reward lower 20% quantile mean:", np.mean(arrays["reward"][arrays["reward"] <= np.quantile(arrays["reward"], 0.2)]))
 
-    np.savez(out_path, **arrays)
-    print(f"saved: {out_path}")
+    if not args.no_save:
+        np.savez(out_path, **arrays)
+        print(f"saved: {out_path}")
+    
     return out_path
 
 
@@ -412,12 +564,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--saluki_body", type=int, default=0)
     parser.add_argument("--cdq", action="store_true", default=False)
 
-    parser.add_argument("--sampler", type=str, default="svdd", choices=["svdd", "smc"])
+    parser.add_argument("--sampler", type=str, default="svdd", choices=["svdd", "svdd_max", "smc"])
+    parser.add_argument('--alpha', type=float, default=1.0)
     parser.add_argument("--batch_size", type=int, default=256)
-    parser.add_argument("--sample_M", type=int, default=5)
+    parser.add_argument("--sample_M", type=int, default=20)
     parser.add_argument("--val_batch_num", type=int, default=1)
     parser.add_argument("--variant", type=str, default="MC", choices=["MC", "PM"])
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--x0_mode", type=str, default="soft", choices=["soft", "hard"])
     parser.add_argument("--device", type=str, default="cuda")
 
     parser.add_argument("--pre_model_path", type=str, default=None)
@@ -426,13 +580,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--reward_ckpt_path", type=str, default=None)
 
     parser.add_argument("--reward_name", type=str, default="HepG2")
-    parser.add_argument("--out_dir", type=str, default="./log")
+    parser.add_argument("--out_dir", type=str, default="./output_dna")
     parser.add_argument("--output_name", type=str, default=None)
     parser.add_argument("--save_samples", action="store_true", default=False)
 
     parser.add_argument("--patch_grelu_ckpt", action="store_true", default=False)
     parser.add_argument("--force_artifact_link", action="store_true", default=False)
+    # parser.add_argument("--sample_baseline", action="store_true", default=False)
     parser.add_argument("--no_tqdm", action="store_true", default=False)
+    parser.add_argument("--no_save", action="store_true", default=False)
 
     return parser
 
