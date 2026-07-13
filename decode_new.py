@@ -29,8 +29,12 @@ from Enformer import BaseModel, BaseModelMultiSep, ConvHead, EnformerTrunk, Time
 
 DNA_DIFFUSION_EXPECTED = Path("artifacts/DNA_Diffusion:v0/last.ckpt")
 DNA_REWARD_EXPECTED = Path("artifacts/DNA_evaluation:v0/model.ckpt")
+DNA_VALUE_EXPECTED = Path("artifacts/DNA_value:v0/human_enhancer_diffusion_enformer_7_11_1536_16_ep10_it3500.pt")
+
 RNA_DIFFUSION_EXPECTED = Path("artifacts/RNA_Diffusion:v0/best.ckpt")
 RNA_REWARD_EXPECTED = Path("artifacts/RNA_evaluation:v0/model.ckpt")
+RNA_MRL_VALUE_EXPECTED = Path("artifacts/RNA_MRL_value:v0/rna_MRL_diffusion_convgru_6_64_512_ep10_it2800.pt")
+RNA_STABILITY_VALUE_EXPECTED = Path("artifacts/RNA_Stability_value:v0/rna_saluki_diffusion_enformer_7_11_1536_16_ep10_it3200.pt")
 
 
 def set_seed(seed: int) -> None:
@@ -204,14 +208,150 @@ def build_model(args, device="cuda"):
     raise NotImplementedError(f"Unknown model: {args.model}")
 
 
-def load_model_state(model, checkpoint_path: Path, strict: bool = True) -> None:
+def _strip_checkpoint_wrappers(key: str) -> str:
+    """Remove common wrappers added by DataParallel, compile, or Lightning."""
+    changed = True
+    while changed:
+        changed = False
+        for prefix in ("module.", "_orig_mod.", "model."):
+            if key.startswith(prefix):
+                key = key[len(prefix):]
+                changed = True
+    return key
+
+
+def _extract_checkpoint_state(checkpoint_path: Path):
     checkpoint = torch_load(checkpoint_path)
-    if isinstance(checkpoint, dict):
-        state = checkpoint.get("model_state_dict", checkpoint.get("state_dict", checkpoint))
+
+    if not isinstance(checkpoint, dict):
+        raise TypeError(f"Checkpoint at {checkpoint_path} must contain a dictionary.")
+
+    if "model_state_dict" in checkpoint:
+        state = checkpoint["model_state_dict"]
+    elif "state_dict" in checkpoint:
+        state = checkpoint["state_dict"]
     else:
         state = checkpoint
-    model.load_state_dict(state, strict=strict)
 
+    if not isinstance(state, dict):
+        raise TypeError(f"Checkpoint at {checkpoint_path} does not contain a valid state dictionary.")
+
+    return {_strip_checkpoint_wrappers(key): value for key, value in state.items()}
+
+
+def _clean_nested_submodule_state(state, submodule_name: str):
+    """Normalize a separately saved embedding/head state dictionary."""
+    prefix = f"{submodule_name}."
+    cleaned = {}
+
+    for raw_key, value in state.items():
+        key = _strip_checkpoint_wrappers(raw_key)
+        if key.startswith(prefix):
+            key = key[len(prefix):]
+        cleaned[key] = value
+
+    return cleaned
+
+
+def load_value_model_state(model, checkpoint_path: Path) -> None:
+    """Load only embedding and head, preserving ref_model and reward_model."""
+    checkpoint = torch_load(checkpoint_path)
+
+    if not isinstance(checkpoint, dict):
+        raise TypeError(f"Checkpoint at {checkpoint_path} must contain a dictionary.")
+
+    # Support a smaller value-only checkpoint format.
+    if isinstance(checkpoint.get("embedding_state_dict"), dict) and isinstance(checkpoint.get("head_state_dict"), dict):
+        embedding_state = _clean_nested_submodule_state(checkpoint["embedding_state_dict"], "embedding")
+        head_state = _clean_nested_submodule_state(checkpoint["head_state_dict"], "head")
+        ignored_roots = []
+    else:
+        if "model_state_dict" in checkpoint:
+            full_state = checkpoint["model_state_dict"]
+        elif "state_dict" in checkpoint:
+            full_state = checkpoint["state_dict"]
+        else:
+            full_state = checkpoint
+
+        if not isinstance(full_state, dict):
+            raise TypeError(f"Checkpoint at {checkpoint_path} does not contain a valid state dictionary.")
+
+        full_state = {_strip_checkpoint_wrappers(key): value for key, value in full_state.items()}
+        embedding_state = {key[len("embedding."):]: value for key, value in full_state.items() if key.startswith("embedding.")}
+        head_state = {key[len("head."):]: value for key, value in full_state.items() if key.startswith("head.")}
+        ignored_roots = sorted({key.split(".", 1)[0] for key in full_state if not key.startswith(("embedding.", "head."))})
+
+    if not embedding_state:
+        raise KeyError(
+            f"No embedding.* weights were found in {checkpoint_path}. "
+            "Check that this is a value-model checkpoint."
+        )
+
+    if not head_state:
+        raise KeyError(
+            f"No head.* weights were found in {checkpoint_path}. "
+            "Check that this is a value-model checkpoint."
+        )
+
+    try:
+        model.embedding.load_state_dict(embedding_state, strict=True)
+        model.head.load_state_dict(head_state, strict=True)
+    except RuntimeError as exc:
+        raise RuntimeError(
+            f"The value-network architecture does not match {checkpoint_path}. "
+            "Check --model and the Enformer architecture used to create the checkpoint."
+        ) from exc
+
+    embedding_tensors = len(embedding_state)
+    head_tensors = len(head_state)
+    embedding_parameters = sum(value.numel() for value in embedding_state.values() if torch.is_tensor(value))
+    head_parameters = sum(value.numel() for value in head_state.values() if torch.is_tensor(value))
+
+    print(
+        f"Loaded value network from {checkpoint_path}: "
+        f"{embedding_tensors} embedding tensors ({embedding_parameters:,} values), "
+        f"{head_tensors} head tensors ({head_parameters:,} values)."
+    )
+
+    if ignored_roots:
+        print("Ignored non-value checkpoint components:", ", ".join(ignored_roots))
+
+def sampler_uses_value_model(args) -> bool:
+    sampler = str(args.sampler).strip().lower()
+    variant = str(args.variant).strip().upper()
+    return variant == "MC" and sampler in {"svdd", "svdd_max", "smc"}
+
+
+def resolve_value_checkpoint(args):
+    pre_model_path = getattr(args, "pre_model_path", None)
+    load_checkpoint_path = getattr(args, "load_checkpoint_path", None)
+
+    if pre_model_path is not None and load_checkpoint_path is not None:
+        print("Both --pre_model_path and --load_checkpoint_path were provided; --load_checkpoint_path will be used.")
+
+    selected_path = load_checkpoint_path or pre_model_path
+    if selected_path is not None:
+        return Path(selected_path)
+
+    if not sampler_uses_value_model(args):
+        return None
+
+    task = str(args.task).strip().lower()
+
+    if task == "dna":
+        default_path = DNA_VALUE_EXPECTED
+    elif task == "rna":
+        default_path = RNA_MRL_VALUE_EXPECTED
+    elif task == "rna_saluki":
+        default_path = RNA_STABILITY_VALUE_EXPECTED
+    else:
+        raise ValueError(
+            f"No default value-network checkpoint is defined for task={args.task!r}. "
+            "Provide --load_checkpoint_path explicitly."
+        )
+
+    print(f"No value checkpoint specified; using default for task={task!r}: {default_path}")
+    return default_path
 
 def reward_predict(model, reward_model, token_batch: torch.Tensor, n_tasks: int) -> torch.Tensor:
     onehot_samples = model.transform_samples(token_batch)
@@ -226,6 +366,28 @@ def reward_predict(model, reward_model, token_batch: torch.Tensor, n_tasks: int)
 
     return pred.reshape(-1), onehot_samples
 
+@torch.no_grad()
+def pretrained_decode_local(model, gen_batch_num: int, show_progress: bool = True):
+    """Sample from the pretrained diffusion model without SVDD or SMC guidance."""
+    if gen_batch_num < 1:
+        raise ValueError(f"gen_batch_num must be positive, got: {gen_batch_num}")
+    if not hasattr(model, "ref_model"):
+        raise AttributeError("The constructed model does not have ref_model; cannot decode.")
+    if not hasattr(model.ref_model, "decode_sample"):
+        raise AttributeError("ref_model does not have decode_sample.")
+    if not hasattr(model, "NUM_SAMPLES_PER_BATCH"):
+        raise AttributeError("The constructed model does not define NUM_SAMPLES_PER_BATCH.")
+
+    model.eval()
+    model.ref_model.eval()
+    samples = []
+
+    for _ in tqdm(range(gen_batch_num), desc="Pretrained generation", unit="batch", dynamic_ncols=True, disable=not show_progress):
+        batch_samples = model.ref_model.decode_sample(eval_sp_size=model.NUM_SAMPLES_PER_BATCH)
+        samples.append(batch_samples.detach())
+
+    print("Pretrained sampling done.")
+    return samples
 
 @torch.no_grad()
 def controlled_decode_local(model, gen_batch_num: int, sample_M: int, n_tasks: int, variant: str = "MC", method: str = "max", alpha: float = 1.0, sample_baseline: bool = False, show_progress: bool = True):
@@ -443,6 +605,65 @@ def tensor_list_to_numpy(samples):
         return np.array([])
     return torch.cat([x.detach().cpu() for x in samples], dim=0).numpy()
 
+def initialize_decode_model(args, device):
+    # BaseModel compares task names against lowercase strings.
+    args.task = str(args.task).strip().lower()
+
+    expected_diffusion, expected_reward = expected_paths_for_task(args.task)
+    diffusion_path_arg = getattr(args, "diffusion_ckpt_path", None)
+    reward_path_arg = getattr(args, "reward_ckpt_path", None)
+    diffusion_ckpt = Path(diffusion_path_arg) if diffusion_path_arg else expected_diffusion
+    reward_ckpt = Path(reward_path_arg) if reward_path_arg else expected_reward
+
+    # These calls do not load the models. They only make the files available
+    # at the hard-coded paths that BaseModel.__init__ will use.
+    prepare_expected_file(
+        diffusion_ckpt,
+        expected_diffusion,
+        force_link=getattr(args, "force_artifact_link", False),
+    )
+    prepare_expected_file(
+        reward_ckpt,
+        expected_reward,
+        force_link=getattr(args, "force_artifact_link", False),
+    )
+
+    if getattr(args, "patch_grelu_ckpt", False):
+        patch_grelu_checkpoint_if_needed(expected_reward)
+
+    print("Constructing BaseModel; diffusion and reward models load during initialization.")
+    model = build_model(args, device)
+
+    value_checkpoint = resolve_value_checkpoint(args)
+
+    if sampler_uses_value_model(args):
+        if value_checkpoint is None:
+            raise ValueError(
+                f"sampler={args.sampler!r} with variant='MC' requires a trained "
+                "value model. Provide --load_checkpoint_path or --pre_model_path."
+            )
+
+        if not value_checkpoint.exists():
+            raise FileNotFoundError(f"Value checkpoint does not exist: {value_checkpoint}")
+
+        print("Loading value network only:", value_checkpoint)
+        load_value_model_state(model, value_checkpoint)
+    
+    elif value_checkpoint is not None:
+        print(
+            f"Ignoring value checkpoint {value_checkpoint} because "
+            f"sampler={args.sampler!r}, variant={args.variant!r} does not use the MC value network."
+        )
+
+    model.to(device)
+    model.eval()
+    model.ref_model.eval()
+    model.reward_model.eval()
+
+    print("Using device:", device)
+    print("Total parameters:", sum(parameter.numel() for parameter in model.parameters()))
+
+    return model
 
 def run(args) -> Path:
     if not torch.cuda.is_available():
@@ -453,35 +674,66 @@ def run(args) -> Path:
 
     set_seed(args.seed)
 
-    expected_diffusion, expected_reward = expected_paths_for_task(args.task)
-    diffusion_ckpt = Path(args.diffusion_ckpt_path) if args.diffusion_ckpt_path else expected_diffusion
-    reward_ckpt = Path(args.reward_ckpt_path) if args.reward_ckpt_path else expected_reward
+    # expected_diffusion, expected_reward = expected_paths_for_task(args.task)
+    # diffusion_ckpt = Path(args.diffusion_ckpt_path) if args.diffusion_ckpt_path else expected_diffusion
+    # reward_ckpt = Path(args.reward_ckpt_path) if args.reward_ckpt_path else expected_reward
+    # value_ckpt = Path(args.value_ckpt_path) if args.value_ckpt_path else DNA_VALUE_EXPECTED
 
-    prepare_expected_file(diffusion_ckpt, expected_diffusion, force_link=args.force_artifact_link)
-    prepare_expected_file(reward_ckpt, expected_reward, force_link=args.force_artifact_link)
+    # prepare_expected_file(diffusion_ckpt, expected_diffusion, force_link=args.force_artifact_link)
+    # prepare_expected_file(reward_ckpt, expected_reward, force_link=args.force_artifact_link)
+    # prepare_expected_file(value_ckpt, DNA_VALUE_EXPECTED, force_link=args.force_artifact_link)
 
-    if args.patch_grelu_ckpt:
-        patch_grelu_checkpoint_if_needed(expected_reward)
+    # if args.patch_grelu_ckpt:
+    #     patch_grelu_checkpoint_if_needed(expected_reward)
 
-    print("loading model")
-    device = args.device if hasattr(args, "device") else "cuda"
-    model = build_model(args, device)
+    # print("loading base models")
+    # device = args.device if hasattr(args, "device") else "cuda"
+    # model = build_model(args, device)
 
-    if args.pre_model_path is not None:
-        print("loading pretrained value model:", args.pre_model_path)
-        load_model_state(model, Path(args.pre_model_path), strict=True)
+    # if args.variant == "MC" and args.sampler in {"svdd", "svdd_max", "smc"}:
+    #     print("loading value model:", value_ckpt)
+    #     load_model_state(model, value_ckpt, strict=True)
 
-    if args.load_checkpoint_path is not None:
-        print("loading stored value model:", args.load_checkpoint_path)
-        load_model_state(model, Path(args.load_checkpoint_path), strict=True)
+    # # if args.pre_model_path is not None:
+    # #     print("loading pretrained value model:", args.pre_model_path)
+    # #     load_model_state(model, Path(args.pre_model_path), strict=True)
 
-    print("total params:", sum(p.numel() for p in model.parameters()))
+    # # if args.load_checkpoint_path is not None:
+    # #     print("loading stored value model:", args.load_checkpoint_path)
+    # #     load_model_state(model, Path(args.load_checkpoint_path), strict=True)
 
-    model.to(device)
-    print("Using device:", device)
 
-    model.eval()
-    if args.sampler == "svdd_max":
+    # print("total params:", sum(p.numel() for p in model.parameters()))
+
+    # model.to(device)
+    # print("Using device:", device)
+
+    # model.eval()
+
+    device = getattr(args, "device", "cuda")
+    model = initialize_decode_model(args, device)
+
+    if args.sampler == "pretrained":
+
+        print("Using pretrained diffusion sampler")
+
+        gen_samples = pretrained_decode_local(
+            model=model,
+            gen_batch_num=args.val_batch_num,
+            show_progress=not args.no_tqdm,
+        )
+
+        # This is post-hoc evaluation only. The reward model does not
+        # influence generation.
+        model.reward_model.eval()
+
+        with torch.no_grad():
+            reward_model_preds = torch.cat([
+                reward_predict(model, model.reward_model, batch_samples, args.n_task)[0]
+                for batch_samples in gen_samples
+            ])
+
+    elif args.sampler == "svdd_max":
 
         print(f"Using {args.sampler} sampler with {args.variant} variant")
 
@@ -529,7 +781,12 @@ def run(args) -> Path:
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    out_name = args.output_name or f"{args.task}-{args.sampler}-{args.variant}-M{args.batch_size if args.sampler == 'smc' else args.sample_M}-S{args.seed}.npz"
+    if args.sampler == "pretrained":
+        out_name = args.output_name or f"{args.task}-{args.sampler}-S{args.seed}.npz"
+    elif args.sampler == "smc":
+        out_name = args.output_name or f"{args.task}-{args.sampler}-{args.variant}-M{args.batch_size}-S{args.seed}.npz"
+    else:   # svdd or svdd_max
+        out_name = args.output_name or f"{args.task}-{args.sampler}-{args.variant}-M{args.sample_M}-S{args.seed}.npz"
     if not out_name.endswith(".npz"):
         out_name += ".npz"
     out_path = out_dir / out_name
@@ -564,18 +821,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--saluki_body", type=int, default=0)
     parser.add_argument("--cdq", action="store_true", default=False)
 
-    parser.add_argument("--sampler", type=str, default="svdd", choices=["svdd", "svdd_max", "smc"])
+    parser.add_argument("--sampler", type=str, default="svdd", choices=["pretrained", "svdd", "svdd_max", "smc"])
     parser.add_argument('--alpha', type=float, default=1.0)
     parser.add_argument("--batch_size", type=int, default=256)
     parser.add_argument("--sample_M", type=int, default=20)
     parser.add_argument("--val_batch_num", type=int, default=1)
-    parser.add_argument("--variant", type=str, default="MC", choices=["MC", "PM"])
+    parser.add_argument("--variant", type=str, default="PM", choices=["MC", "PM"])
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--x0_mode", type=str, default="soft", choices=["soft", "hard"])
     parser.add_argument("--device", type=str, default="cuda")
 
-    parser.add_argument("--pre_model_path", type=str, default=None)
-    parser.add_argument("--load_checkpoint_path", type=str, default=None)
+    parser.add_argument("--value_ckpt_path", type=str, default=None)
+    # parser.add_argument("--load_checkpoint_path", type=str, default=None)
     parser.add_argument("--diffusion_ckpt_path", type=str, default=None)
     parser.add_argument("--reward_ckpt_path", type=str, default=None)
 
