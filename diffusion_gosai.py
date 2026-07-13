@@ -1223,7 +1223,9 @@ class Diffusion(L.LightningModule):
     return x
 
   @torch.no_grad()
-  def controlled_sample(self, pre_scorer_embedding, pre_scorer_head, num_steps=None, eps=1e-5, eval_sp_size=None, sample_M=10, selection_method="max", selection_alpha=1.0):
+  def controlled_sample(self, pre_scorer_embedding, pre_scorer_head, num_steps=None, eps=1e-5, 
+      eval_sp_size=None, sample_M=10, selection_method="max", selection_alpha=1.0, reward_channel=0
+      ):
     """Generate samples from the model."""
     if eval_sp_size is None:
       batch_size_per_gpu = self.config.loader.eval_batch_size
@@ -1247,7 +1249,8 @@ class Diffusion(L.LightningModule):
       t = timesteps[i] * torch.ones(
         x.shape[0], 1, device=self.device)
       if self.sampler == 'ddpm':
-        x, x1, x2, x3 = self._ddpm_update_finetune_controlled(x, t, dt, pre_scorer_embedding, pre_scorer_head, repeats=sample_M, selection_method=selection_method, selection_alpha=selection_alpha)
+        x, x1, x2, x3 = self._ddpm_update_finetune_controlled(x, t, dt, pre_scorer_embedding, pre_scorer_head, 
+          repeats=sample_M, selection_method=selection_method, selection_alpha=selection_alpha, reward_channel=reward_channel)
       else:
         x = self._analytic_update(x, t, dt)
 
@@ -1308,7 +1311,9 @@ class Diffusion(L.LightningModule):
     return x
   
   @torch.no_grad()
-  def controlled_sample_tweedie(self, reward_model, num_steps=None, eps=1e-5, eval_sp_size=None, sample_M=10, options="True", task='dna', selection_method="max", selection_alpha=1.0):
+  def controlled_sample_tweedie(self, reward_model, num_steps=None, eps=1e-5, eval_sp_size=None, sample_M=10, 
+      options="True", task='dna', selection_method="max", selection_alpha=1.0, reward_channel=0
+      ):
     """Generate samples from the model."""
     if eval_sp_size is None:
       batch_size_per_gpu = self.config.loader.eval_batch_size
@@ -1332,7 +1337,8 @@ class Diffusion(L.LightningModule):
       t = timesteps[i] * torch.ones(
         x.shape[0], 1, device=self.device)
       if self.sampler == 'ddpm':
-        x, x1, x2, x3 = self._ddpm_update_finetune_controlled_tweedie(x, t, dt, reward_model, repeats=sample_M, options = options, task=task, selection_method=selection_method, selection_alpha=selection_alpha)
+        x, x1, x2, x3 = self._ddpm_update_finetune_controlled_tweedie(x, t, dt, reward_model, repeats=sample_M, options=options, 
+            task=task, selection_method=selection_method, selection_alpha=selection_alpha, reward_channel=reward_channel)
       else:
         x = self._analytic_update(x, t, dt)
 
@@ -1723,7 +1729,11 @@ class Diffusion(L.LightningModule):
     return copy_flag * x + (1 - copy_flag) * _x, x, q_xs, copy_flag
 
   @torch.no_grad()
-  def _ddpm_update_finetune_controlled(self, x, t, dt, pre_scorer_embedding, pre_scorer_head, repeats=10, selection_method="max", selection_alpha=1.0):
+  def _ddpm_update_finetune_controlled(self, x, t, dt, pre_scorer_embedding, pre_scorer_head, 
+      repeats=10, selection_method="max", selection_alpha=1.0, reward_channel=0
+  ):
+    if reward_channel != 0:
+      raise NotImplementedError("reward_channel != 0 is not implemented yet. Please set reward_channel=0 for now.")
     sigma_t, _ = self.noise(t)
     sigma_s, _ = self.noise(t - dt)
     if sigma_t.ndim > 1:
@@ -1757,7 +1767,14 @@ class Diffusion(L.LightningModule):
     scores = []
     for i in range(repeats):
       pre_scorer_input = pre_scorer_embedding(self.transform_samples(samples[i]).float())  # Customize this part based on your pre_scorer input requirements
-      scores.append(pre_scorer_head(pre_scorer_input).reshape(x.size(0)))
+      # scores.append(pre_scorer_head(pre_scorer_input).reshape(x.size(0)))
+      score = pre_scorer_head(pre_scorer_input).reshape(x.size(0), -1)
+      channel = int(reward_channel)
+
+      if not 0 <= channel < score.shape[1]:
+          raise ValueError(f"reward_channel={channel} is invalid for value output shape {tuple(score.shape)}")
+
+      scores.append(score[:, channel])
 
     # scores = torch.softmax(scores, dim=0)  # Convert scores to probabilities
     # # Sample from the weighted categorical distribution formed by scores
@@ -1933,7 +1950,9 @@ class Diffusion(L.LightningModule):
     return x_grad
   
   @torch.no_grad()
-  def _ddpm_update_finetune_controlled_tweedie(self, x, t, dt, reward_model, repeats=10, options = "True", task="dna", selection_method="max", selection_alpha=1.0):
+  def _ddpm_update_finetune_controlled_tweedie(self, x, t, dt, reward_model, repeats=10, options = "True", task="dna", 
+      selection_method="max", selection_alpha=1.0, reward_channel=0
+  ):
     sigma_t, _ = self.noise(t)
     sigma_s, _ = self.noise(t - dt)
     if sigma_t.ndim > 1:
@@ -1985,17 +2004,32 @@ class Diffusion(L.LightningModule):
         copy_flag = (samples[i] != self.mask_index).to(raw_seq.dtype)
         expected_x0_onehot = copy_flag[:, :, None] * raw_seq
       #expected_x0_arg = samples[i] #This means we use raw x_t
-      if task == "rna_saluki":
-        scorer = reward_model(self.transform_samples_saluki(expected_x0_onehot).float()).detach().squeeze(2)
-      else:
+      # if task == "rna_saluki":
+      #   scorer = reward_model(self.transform_samples_saluki(expected_x0_onehot).float()).detach().squeeze(2)
+      # else:
   
-        scorer0 = reward_model(expected_x0_onehot.float().transpose(1, 2)).detach()[:, 0]
-        #scorer1 = reward_model(expected_x0_onehot.float().transpose(1, 2)).detach()[:, 1]
-        #scorer2 = reward_model(expected_x0_onehot.float().transpose(1, 2)).detach()[:, 2] 
-        #reward_pes1 = torch.clamp(5.0*(threshold - scorer1),max=1.0)
-        #reward_pes2 = torch.clamp(5.0*(threshold -  scorer2),max=1.0)
-        scorer = scorer0 #- 1.0 * ( scorer1 + scorer2 )  ###+  torch.log(torch.clamp(reward_pes1,min= 1e-40) ) + torch.log(torch.clamp(reward_pes2,min= 1e-40) ) 
-      scores.append(scorer.reshape(x.size(0)))
+      #   scorer0 = reward_model(expected_x0_onehot.float().transpose(1, 2)).detach()[:, 0]
+      #   #scorer1 = reward_model(expected_x0_onehot.float().transpose(1, 2)).detach()[:, 1]
+      #   #scorer2 = reward_model(expected_x0_onehot.float().transpose(1, 2)).detach()[:, 2] 
+      #   #reward_pes1 = torch.clamp(5.0*(threshold - scorer1),max=1.0)
+      #   #reward_pes2 = torch.clamp(5.0*(threshold -  scorer2),max=1.0)
+      #   scorer = scorer0 #- 1.0 * ( scorer1 + scorer2 )  ###+  torch.log(torch.clamp(reward_pes1,min= 1e-40) ) + torch.log(torch.clamp(reward_pes2,min= 1e-40) ) 
+      # scores.append(scorer.reshape(x.size(0)))
+
+      if task == "rna_saluki":
+        reward = reward_model(self.transform_samples_saluki(expected_x0_onehot).float()).detach()
+        scorer = reward.reshape(x.size(0), -1)[:, 0]
+      else:
+        reward = reward_model(expected_x0_onehot.float().transpose(1, 2)).detach()
+        reward = reward.reshape(x.size(0), -1)
+        channel = int(reward_channel)
+
+        if not 0 <= channel < reward.shape[1]:
+            raise ValueError(f"reward_channel={channel} is invalid for oracle output shape {tuple(reward.shape)}")
+
+        scorer = reward[:, channel]
+
+      scores.append(scorer)
 
       #######################################
       #######################################

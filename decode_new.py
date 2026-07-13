@@ -29,6 +29,7 @@ from Enformer import BaseModel, BaseModelMultiSep, ConvHead, EnformerTrunk, Time
 
 DNA_DIFFUSION_EXPECTED = Path("artifacts/DNA_Diffusion:v0/last.ckpt")
 DNA_REWARD_EXPECTED = Path("artifacts/DNA_evaluation:v0/model.ckpt")
+# For HepG2, the best checkpoint is at iteration 3500.
 DNA_VALUE_EXPECTED = Path("artifacts/DNA_value:v0/human_enhancer_diffusion_enformer_7_11_1536_16_ep10_it3500.pt")
 
 RNA_DIFFUSION_EXPECTED = Path("artifacts/RNA_Diffusion:v0/best.ckpt")
@@ -36,6 +37,18 @@ RNA_REWARD_EXPECTED = Path("artifacts/RNA_evaluation:v0/model.ckpt")
 RNA_MRL_VALUE_EXPECTED = Path("artifacts/RNA_MRL_value:v0/rna_MRL_diffusion_convgru_6_64_512_ep10_it2800.pt")
 RNA_STABILITY_VALUE_EXPECTED = Path("artifacts/RNA_Stability_value:v0/rna_saluki_diffusion_enformer_7_11_1536_16_ep10_it3200.pt")
 
+DNA_REWARD_CHANNELS = {"hepg2": 0, "k562": 1, "sknsh": 2}
+
+def normalize_reward_name(name: str) -> str:
+    key = str(name).strip().lower().replace("-", "").replace("_", "")
+    if key not in DNA_REWARD_CHANNELS:
+        raise argparse.ArgumentTypeError("reward_name must be HepG2, K562, or SK-N-SH")
+    return key
+
+def resolve_oracle_reward_channel(task: str, reward_name: str) -> int:
+    if str(task).strip().lower() != "dna":
+        return 0
+    return DNA_REWARD_CHANNELS[normalize_reward_name(reward_name)]
 
 def set_seed(seed: int) -> None:
     random.seed(seed)
@@ -323,13 +336,8 @@ def sampler_uses_value_model(args) -> bool:
 
 
 def resolve_value_checkpoint(args):
-    pre_model_path = getattr(args, "pre_model_path", None)
-    load_checkpoint_path = getattr(args, "load_checkpoint_path", None)
+    selected_path = getattr(args, "value_ckpt_path", None)
 
-    if pre_model_path is not None and load_checkpoint_path is not None:
-        print("Both --pre_model_path and --load_checkpoint_path were provided; --load_checkpoint_path will be used.")
-
-    selected_path = load_checkpoint_path or pre_model_path
     if selected_path is not None:
         return Path(selected_path)
 
@@ -339,32 +347,41 @@ def resolve_value_checkpoint(args):
     task = str(args.task).strip().lower()
 
     if task == "dna":
+        reward_name = normalize_reward_name(args.reward_name)
+
+        if reward_name != "hepg2":
+            raise ValueError(
+                f"No default MC value checkpoint is defined for DNA reward {reward_name!r}. "
+                "Use variant='PM' or provide a matching checkpoint with --value_ckpt_path."
+            )
+
         default_path = DNA_VALUE_EXPECTED
     elif task == "rna":
         default_path = RNA_MRL_VALUE_EXPECTED
     elif task == "rna_saluki":
         default_path = RNA_STABILITY_VALUE_EXPECTED
     else:
-        raise ValueError(
-            f"No default value-network checkpoint is defined for task={args.task!r}. "
-            "Provide --load_checkpoint_path explicitly."
-        )
+        raise ValueError(f"No default value-network checkpoint is defined for task={args.task!r}")
 
     print(f"No value checkpoint specified; using default for task={task!r}: {default_path}")
     return default_path
 
-def reward_predict(model, reward_model, token_batch: torch.Tensor, n_tasks: int) -> torch.Tensor:
+def reward_predict(model, reward_model, token_batch: torch.Tensor, n_tasks: int, reward_channel: int = 0):
     onehot_samples = model.transform_samples(token_batch)
     task_l = getattr(model, "task", "").lower()
 
     if task_l == "rna_saluki":
-        pred = reward_model(model.transform_samples_saluki(token_batch).float()).detach().squeeze(2)
-    elif n_tasks == 1:
-        pred = reward_model(onehot_samples.float().transpose(1, 2)).detach()[:, 0]
+        pred_all = reward_model(model.transform_samples_saluki(token_batch).float()).detach()
     else:
-        pred = reward_model(onehot_samples.float().transpose(1, 2)).detach()
+        pred_all = reward_model(onehot_samples.float().transpose(1, 2)).detach()
 
-    return pred.reshape(-1), onehot_samples
+    pred_all = pred_all.reshape(token_batch.shape[0], -1)
+    channel = int(reward_channel) if task_l == "dna" else 0
+
+    if not 0 <= channel < pred_all.shape[1]:
+        raise ValueError(f"reward_channel={channel} is invalid for oracle output shape {tuple(pred_all.shape)}")
+
+    return pred_all[:, channel], onehot_samples
 
 @torch.no_grad()
 def pretrained_decode_local(model, gen_batch_num: int, show_progress: bool = True):
@@ -390,7 +407,9 @@ def pretrained_decode_local(model, gen_batch_num: int, show_progress: bool = Tru
     return samples
 
 @torch.no_grad()
-def controlled_decode_local(model, gen_batch_num: int, sample_M: int, n_tasks: int, variant: str = "MC", method: str = "max", alpha: float = 1.0, sample_baseline: bool = False, show_progress: bool = True):
+def controlled_decode_local(model, gen_batch_num: int, sample_M: int, n_tasks: int, variant: str = "MC", method: str = "max", 
+        alpha: float = 1.0, reward_channel: int = 0, sample_baseline: bool = False, show_progress: bool = True
+    ):
     """
     Controlled decoding with tqdm.
 
@@ -434,6 +453,7 @@ def controlled_decode_local(model, gen_batch_num: int, sample_M: int, n_tasks: i
                 sample_M=sample_M,
                 selection_method=method,
                 selection_alpha=alpha,
+                reward_channel=reward_channel
             )
         else:  # variant == "PM"
             batch_samples = model.ref_model.controlled_sample_tweedie(
@@ -444,11 +464,12 @@ def controlled_decode_local(model, gen_batch_num: int, sample_M: int, n_tasks: i
                 task=tweedie_task,
                 selection_method=method,
                 selection_alpha=alpha,
+                reward_channel=reward_channel
             )
 
         samples.append(batch_samples.detach())
 
-        pred, _ = reward_predict(model, reward_model, batch_samples, n_tasks)
+        pred, _ = reward_predict(model, reward_model, batch_samples, n_tasks, reward_channel=reward_channel)
 
         # if variant == "MC":
         #     value = model.head(
@@ -523,6 +544,8 @@ def controlled_decode_smc_local(model, gen_batch_num: int, n_tasks: int, alpha: 
         raise AttributeError("ref_model does not have controlled_sample_smc; add it to diffusion_gosai.py first.")
     if variant == "MC" and not hasattr(model.ref_model, "_mc_value_from_tokens"):
         raise AttributeError("ref_model does not have _mc_value_from_tokens; add the MC helper to diffusion_gosai.py first.")
+    if variant == "MC" and reward_channel != 0:
+        raise NotImplementedError("MC variant does not support reward_channel != 0; implement it in _mc_value_from_tokens first.")
 
     reward_model = model.reward_model
     mc_timed = bool(getattr(model, "timed", False)) if mc_timed is None else bool(mc_timed)
@@ -710,6 +733,9 @@ def run(args) -> Path:
 
     # model.eval()
 
+    reward_channel = resolve_oracle_reward_channel(args.task, args.reward_name)
+    print(f"Reward objective: {args.reward_name}", f"Reward channel: {reward_channel}")
+
     device = getattr(args, "device", "cuda")
     model = initialize_decode_model(args, device)
 
@@ -729,7 +755,7 @@ def run(args) -> Path:
 
         with torch.no_grad():
             reward_model_preds = torch.cat([
-                reward_predict(model, model.reward_model, batch_samples, args.n_task)[0]
+                reward_predict(model, model.reward_model, batch_samples, args.n_task, reward_channel=reward_channel)[0]
                 for batch_samples in gen_samples
             ])
 
@@ -745,6 +771,7 @@ def run(args) -> Path:
             variant=args.variant,
             method="max",
             alpha=1.0,      # Does not matter for max selection, but still needs to be passed
+            reward_channel=reward_channel,
             show_progress=not args.no_tqdm,
         )
     elif args.sampler == "svdd":
@@ -759,6 +786,7 @@ def run(args) -> Path:
             variant=args.variant,
             method="resample",
             alpha=args.alpha,
+            reward_channel=reward_channel,
             show_progress=not args.no_tqdm,
         )
     elif args.sampler == "smc":
@@ -774,19 +802,29 @@ def run(args) -> Path:
             ess_resample_ratio=.5,
             resampling_method="ess",
             x0_mode=args.x0_mode,
+            reward_channel=reward_channel,
             show_progress=not args.no_tqdm,
         )
     else:
         raise ValueError(f"Unknown sampler: {args.sampler}")
 
+    if str(args.task).lower() == "dna":
+        reward_tag = normalize_reward_name(args.reward_name)
+    elif str(args.task).lower() == "rna":
+        reward_tag = "mrl"
+    elif str(args.task).lower() == "rna_saluki":
+        reward_tag = "stability"
+    else:
+        reward_tag = str(args.task).lower()
+    
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     if args.sampler == "pretrained":
-        out_name = args.output_name or f"{args.task}-{args.sampler}-S{args.seed}.npz"
+        out_name = args.output_name or f"{args.task}-{reward_tag}-{args.sampler}-S{args.seed}.npz"
     elif args.sampler == "smc":
-        out_name = args.output_name or f"{args.task}-{args.sampler}-{args.variant}-M{args.batch_size}-S{args.seed}.npz"
+        out_name = args.output_name or f"{args.task}-{reward_tag}-{args.sampler}-{args.variant}-M{args.batch_size}-S{args.seed}.npz"
     else:   # svdd or svdd_max
-        out_name = args.output_name or f"{args.task}-{args.sampler}-{args.variant}-M{args.sample_M}-S{args.seed}.npz"
+        out_name = args.output_name or f"{args.task}-{reward_tag}-{args.sampler}-{args.variant}-M{args.sample_M}-S{args.seed}.npz"
     if not out_name.endswith(".npz"):
         out_name += ".npz"
     out_path = out_dir / out_name
@@ -836,7 +874,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--diffusion_ckpt_path", type=str, default=None)
     parser.add_argument("--reward_ckpt_path", type=str, default=None)
 
-    parser.add_argument("--reward_name", type=str, default="HepG2")
+    parser.add_argument("--reward_name", type=str, default="hepg2", choices=tuple(DNA_REWARD_CHANNELS.keys()), help="DNA oracle objective: HepG2, K562, or SK-N-SH.")
     parser.add_argument("--out_dir", type=str, default="./output_dna")
     parser.add_argument("--output_name", type=str, default=None)
     parser.add_argument("--save_samples", action="store_true", default=False)
