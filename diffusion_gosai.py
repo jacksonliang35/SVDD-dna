@@ -204,8 +204,11 @@ def _select_particle_indices_from_logw(
   
 def _select_sample_indices_from_scores(
     scores,
-    selection_method="max",
+    selection_method="resample",
     alpha=1.0,
+    cvar_beta=None,
+    cvar_eta=None,
+    cvar_lambda=0.0,
 ):
   """Select one proposal per batch element.
 
@@ -215,6 +218,9 @@ def _select_sample_indices_from_scores(
       - "max": current behavior, choose highest-score proposal.
       - "resample": sample proposal with probability proportional to exp(score / alpha).
     alpha: resampling temperature. Smaller is greedier; larger is flatter.
+    cvar_beta: CVaR beta parameter.
+    cvar_eta: CVaR eta parameter.
+    cvar_lambda: CVaR lambda parameter.
 
   Returns:
     Tensor of shape [batch_size] containing selected proposal indices.
@@ -227,10 +233,11 @@ def _select_sample_indices_from_scores(
   method = str(selection_method).strip().lower()
 
   if method in {"max", "argmax", "best"}:
+    # max selection does not require any additional parameters, so we can ignore alpha, cvar_beta, cvar_eta, and cvar_lambda.
     return torch.argmax(scores, dim=1)
 
   if method in {"resample", "resampling", "sample"}:
-    logw = _log_weight_from_score(scores, alpha=alpha)
+    logw = _log_weight_from_score(scores, alpha=alpha, cvar_beta=cvar_beta, cvar_eta=cvar_eta, cvar_lambda=cvar_lambda)
     return _torch_resample_from_logw(logw, num_samples=1).squeeze(1)
 
   raise ValueError(
