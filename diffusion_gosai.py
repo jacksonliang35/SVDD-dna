@@ -1231,7 +1231,8 @@ class Diffusion(L.LightningModule):
 
   @torch.no_grad()
   def controlled_sample(self, pre_scorer_embedding, pre_scorer_head, num_steps=None, eps=1e-5, 
-      eval_sp_size=None, sample_M=10, selection_method="max", selection_alpha=1.0, reward_channel=0
+      cvar_beta=None, cvar_eta=None, cvar_lambda=0.0, eval_sp_size=None, sample_M=10, 
+      selection_method="max", selection_alpha=1.0, reward_channel=0, show_progress=True
       ):
     """Generate samples from the model."""
     if eval_sp_size is None:
@@ -1252,12 +1253,13 @@ class Diffusion(L.LightningModule):
     p_x0_cache = None
 
     # for i in range(num_steps):
-    for i in tqdm(range(num_steps), desc="Diffusion steps", unit="step", leave=False, dynamic_ncols=True):
+    for i in tqdm(range(num_steps), desc="Diffusion steps", unit="step", leave=False, dynamic_ncols=True, disable=not show_progress):
       t = timesteps[i] * torch.ones(
         x.shape[0], 1, device=self.device)
       if self.sampler == 'ddpm':
         x, x1, x2, x3 = self._ddpm_update_finetune_controlled(x, t, dt, pre_scorer_embedding, pre_scorer_head, 
-          repeats=sample_M, selection_method=selection_method, selection_alpha=selection_alpha, reward_channel=reward_channel)
+          repeats=sample_M, cvar_beta=cvar_beta, cvar_eta=cvar_eta, cvar_lambda=cvar_lambda, 
+          selection_method=selection_method, selection_alpha=selection_alpha, reward_channel=reward_channel)
       else:
         x = self._analytic_update(x, t, dt)
 
@@ -1319,7 +1321,8 @@ class Diffusion(L.LightningModule):
   
   @torch.no_grad()
   def controlled_sample_tweedie(self, reward_model, num_steps=None, eps=1e-5, eval_sp_size=None, sample_M=10, 
-      options="True", task='dna', selection_method="max", selection_alpha=1.0, reward_channel=0
+      cvar_beta=None, cvar_eta=None, cvar_lambda=0.0, options="True", task='dna', selection_method="max",
+      selection_alpha=1.0, reward_channel=0, show_progress=True
       ):
     """Generate samples from the model."""
     if eval_sp_size is None:
@@ -1340,12 +1343,13 @@ class Diffusion(L.LightningModule):
     p_x0_cache = None
 
     # for i in range(num_steps):
-    for i in tqdm(range(num_steps), desc="Diffusion steps", unit="step", leave=False, dynamic_ncols=True):
+    for i in tqdm(range(num_steps), desc="Diffusion steps", unit="step", leave=False, dynamic_ncols=True, disable=not show_progress):
       t = timesteps[i] * torch.ones(
         x.shape[0], 1, device=self.device)
       if self.sampler == 'ddpm':
-        x, x1, x2, x3 = self._ddpm_update_finetune_controlled_tweedie(x, t, dt, reward_model, repeats=sample_M, options=options, 
-            task=task, selection_method=selection_method, selection_alpha=selection_alpha, reward_channel=reward_channel)
+        x, x1, x2, x3 = self._ddpm_update_finetune_controlled_tweedie(x, t, dt, reward_model, repeats=sample_M, 
+            options=options, task=task, cvar_beta=cvar_beta, cvar_eta=cvar_eta, cvar_lambda=cvar_lambda, 
+            selection_method=selection_method, selection_alpha=selection_alpha, reward_channel=reward_channel)
       else:
         x = self._analytic_update(x, t, dt)
 
@@ -1498,7 +1502,7 @@ class Diffusion(L.LightningModule):
   def controlled_sample_smc(self, alpha, num_steps=None, eps=1e-5, eval_sp_size=None,
       cvar_beta=None, cvar_eta=None, cvar_lambda=0.0, ess_resample_ratio=0.5, resampling_method="ess",
       selection_method="resample", variant="PM", reward_model=None, pre_scorer_embedding=None, pre_scorer_head=None,
-      mc_timed=False,task="dna", reward_channel=0, x0_mode="soft", return_diagnostics=False
+      mc_timed=False,task="dna", reward_channel=0, x0_mode="soft", return_diagnostics=False, show_progress=True
   ):
     """SMC sampler adapted from SVDD-image's sample_smc.
 
@@ -1609,7 +1613,7 @@ class Diffusion(L.LightningModule):
     ess_history = []
     resampled_history = []
 
-    for i in tqdm(range(num_steps), desc="SMC steps", unit="step", leave=False, dynamic_ncols=True):
+    for i in tqdm(range(num_steps), desc="SMC steps", unit="step", leave=False, dynamic_ncols=True, disable=not show_progress):
       t = timesteps[i] * torch.ones(B, 1, device=self.device)
 
       # -------------------------------------------------------------
@@ -1737,7 +1741,8 @@ class Diffusion(L.LightningModule):
 
   @torch.no_grad()
   def _ddpm_update_finetune_controlled(self, x, t, dt, pre_scorer_embedding, pre_scorer_head, 
-      repeats=10, selection_method="max", selection_alpha=1.0, reward_channel=0
+      cvar_beta=None, cvar_eta=None, cvar_lambda=0.0, repeats=10, selection_method="max", selection_alpha=1.0, 
+      reward_channel=0
   ):
     if reward_channel != 0:
       raise NotImplementedError("reward_channel != 0 is not implemented yet. Please set reward_channel=0 for now.")
@@ -1806,6 +1811,9 @@ class Diffusion(L.LightningModule):
         scores,
         selection_method=selection_method,
         alpha=selection_alpha,
+        cvar_beta=cvar_beta,
+        cvar_eta=cvar_eta,
+        cvar_lambda=cvar_lambda
     )  # Shape [batch_size]
 
     samples_tensor = torch.stack(samples, dim=1)  # Shape [batch_size, repeats, seq_length]
@@ -1958,7 +1966,7 @@ class Diffusion(L.LightningModule):
   
   @torch.no_grad()
   def _ddpm_update_finetune_controlled_tweedie(self, x, t, dt, reward_model, repeats=10, options = "True", task="dna", 
-      selection_method="max", selection_alpha=1.0, reward_channel=0
+      cvar_beta=None, cvar_eta=None, cvar_lambda=0.0, selection_method="max", selection_alpha=1.0, reward_channel=0
   ):
     sigma_t, _ = self.noise(t)
     sigma_s, _ = self.noise(t - dt)
@@ -2067,6 +2075,9 @@ class Diffusion(L.LightningModule):
         scores,
         selection_method=selection_method,
         alpha=selection_alpha,
+        cvar_beta=cvar_beta,
+        cvar_eta=cvar_eta,
+        cvar_lambda=cvar_lambda
     )  # Shape [batch_size]
 
     samples_tensor = torch.stack(samples, dim=1)  # Shape [batch_size, repeats, seq_length]
